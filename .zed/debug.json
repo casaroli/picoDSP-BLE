@@ -1,0 +1,32 @@
+[
+  {
+    "label": "Launch probe-rs debugging",
+    "adapter": "probe-rs",
+    "request": "launch",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "flashingConfig": {
+      "flashingEnabled": true,
+      "verifyBeforeFlashing": true,
+      "verifyAfterFlashing": true,
+      "haltAfterReset": true,
+    },
+    "consoleLogLevel": "Debug",
+    "chip": "RP235x",
+    "coreConfigs": [
+      {
+        "coreIndex": 0,
+        "programBinary": "target/thumbv8m.main-none-eabihf/debug/rp2350-synth",
+        "rttEnabled": true,
+        "rttChannelFormats": [
+          {
+            "channelNumber": 0,
+            // Format RTT data as String data
+            "dataFormat": "String",
+            // Include host-side timestamps for every line of data transferred from the target RTT output
+            "showTimestamps": true,
+          },
+        ],
+      },
+    ],
+  },
+]
