@@ -14,6 +14,7 @@ use alloc::sync::Arc;
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 use defmt::*;
+use embassy_time::Timer;
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -48,10 +49,10 @@ fn init_heap() {
     }
 }
 
-#[unsafe(link_section = ".sram4")]
+// #[unsafe(link_section = ".sram4")]
 static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 
-#[unsafe(link_section = ".sram5")]
+// #[unsafe(link_section = ".sram5")]
 static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
 
 #[embassy_executor::main]
@@ -90,9 +91,7 @@ async fn main(spawner: Spawner) {
         p.CORE1,
         unsafe { &mut *addr_of_mut!(CORE1_STACK) },
         move || {
-            info!("will init");
             let executor = EXECUTOR1.init(embassy_executor::Executor::new());
-            info!("will run");
             executor.run(|spawner| {
                 spawner.spawn(core1::core1_task(midi_control_core1, preset, stack_ptr_val).unwrap())
             });

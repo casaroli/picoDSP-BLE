@@ -10,7 +10,6 @@ use crate::control::midi::{MidiControl, midi_task};
 use crate::data::storage::Storage;
 use crate::usb::device;
 use crate::usb::logger;
-use defmt::*;
 
 pub async fn main_task(
     spawner: Spawner,
@@ -51,7 +50,6 @@ pub async fn main_task(
             let mut usb_audio_bytes = [0u8; 48 * 2 * 2];
 
             while usb_frames_collected < 48 {
-                info!("usb frames collected: {}", usb_frames_collected);
                 if dsp_buffer_idx >= BLOCK_SIZE {
                     let audio_data = AUDIO_CHANNEL.receive().await;
                     dsp_buffer = audio_data.buffer;
@@ -86,9 +84,7 @@ pub async fn main_task(
                 }
             }
 
-            info!("will write packet");
             let _ = microphone.write_packet(&usb_audio_bytes).await;
-            info!("wrote packet");
         }
     } else {
         loop {
