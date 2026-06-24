@@ -1,7 +1,13 @@
 use crate::data::presets::Preset;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+
+/// Set by core0 after a flash erase/program completes. A flash op corrupts a few
+/// already-stored words of the PSRAM-backed delay buffer (and the corruption then
+/// recirculates through the delay feedback), so core1 must rebuild the synth to
+/// re-zero the delay buffer once the flash op is done. See [`crate::psram::reinit`].
+pub static SYNTH_RESET_REQ: AtomicBool = AtomicBool::new(false);
 
 /// Count of audio-output underruns (AUDIO_CHANNEL found empty when core0 needed a block).
 /// A nonzero value is a click/stutter; this is the metric that actually matters, not the

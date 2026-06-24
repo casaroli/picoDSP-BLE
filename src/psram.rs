@@ -53,15 +53,19 @@ impl PsramRegion {
 ///
 /// Panics if the APS6404L is not detected — on this board PSRAM is expected, so a
 /// missing/failed part is fatal (matches the reference driver's behaviour).
+/// PSRAM controller config shared by init and reinit.
+fn psram_config() -> Config {
+    let mut config = Config::aps6404l();
+    // The built-in default assumes a 125 MHz system clock; feed it the *actual*
+    // clock so the derived divisor / rxdelay / max_select / min_deselect are right.
+    config.clock_hz = clocks::clk_sys_freq();
+    config
+}
+
 pub fn init(qmi_cs1: Peri<'static, QMI_CS1>, cs1_pin: Peri<'static, PIN_47>) -> PsramRegion {
     let cs1 = QmiCs1::new(qmi_cs1, cs1_pin);
 
-    let mut config = Config::aps6404l();
-    // The built-in default assumes a 125 MHz system clock; feed it the *actual*
-    // clock so the derived QMI divisor / rxdelay / max_select / min_deselect
-    // timings are correct (default RP2350 boot clock is 150 MHz).
-    config.clock_hz = clocks::clk_sys_freq();
-
+    let config = psram_config();
     let size = config.mem_size;
 
     match Psram::new(cs1, config) {
@@ -84,6 +88,51 @@ pub fn init(qmi_cs1: Peri<'static, QMI_CS1>, cs1_pin: Peri<'static, PIN_47>) -> 
             let _ = size;
             defmt::panic!("PSRAM init failed: {:?}", e);
         }
+    }
+}
+
+/// Handle the fallout of a flash erase/program. Call this on core0 immediately
+/// after any flash write completes.
+///
+/// A flash op has two effects on the PSRAM, which shares the QMI with the flash:
+///  1. It clobbers the CS1 controller config (the bootrom `flash_enter_cmd_xip`
+///     only restores CS0), so PSRAM access must be re-established — [`reinit`].
+///  2. It corrupts a handful of already-stored words in PSRAM (the APS6404 is
+///     pseudo-static and the long erase disturbs it; reads/writes themselves stay
+///     fine afterwards). For the delay this is fatal: the corrupt samples
+///     recirculate through its feedback into sustained noise. So we ask core1 to
+///     rebuild the synth, which re-zeros the delay buffer and clears it.
+pub fn after_flash_write() {
+    reinit();
+    crate::common::shared::SYNTH_RESET_REQ.store(true, Ordering::Release);
+}
+
+/// Set the shared QSPI data pads (SCLK + SD0..3) to max drive / fast slew.
+/// Hygiene — flash and PSRAM share these pads and a flash op can lower their drive.
+fn boost_qspi_pads() {
+    use embassy_rp::pac;
+    // PADS_QSPI.gpio(n): 0=SCLK, 1=SD0, 2=SD1, 3=SD2, 4=SD3, 5=SS.
+    for n in 0..=4usize {
+        pac::PADS_QSPI.gpio(n).modify(|w| {
+            w.set_drive(pac::pads::vals::Drive::_12M_A);
+            w.set_slewfast(true);
+            w.set_ie(true);
+        });
+    }
+    cortex_m::asm::dsb();
+}
+
+/// Re-establish PSRAM access after a flash op clobbered the CS1 config. Re-runs the
+/// full embassy init (chip reset 0xf5, re-detect, re-enter QPI 0x35, reconfigure M1).
+/// `Psram::new` pauses core1 and runs its timing-critical parts from RAM, so it's
+/// safe to call from flash. The peripherals were consumed at boot, so steal them
+/// back — we statically know nothing else owns QMI CS1 / GPIO47.
+pub fn reinit() {
+    boost_qspi_pads();
+    let cs1 = QmiCs1::new(unsafe { QMI_CS1::steal() }, unsafe { PIN_47::steal() });
+    match Psram::new(cs1, psram_config()) {
+        Ok(_) => info!("PSRAM: re-init after flash op OK"),
+        Err(e) => defmt::error!("PSRAM re-init after flash failed: {:?}", e),
     }
 }
 

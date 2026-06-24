@@ -91,6 +91,7 @@ impl<'d> Storage<'d> {
         }
 
         self.flash.write(ADDR_OFFSET, &sector_buf).await.unwrap();
+        crate::psram::after_flash_write();
         log_storage!("Formatted and wrote defaults.\r\n");
     }
 
@@ -143,6 +144,8 @@ impl<'d> Storage<'d> {
         log_storage!("SysEx Write: Writing {} bytes...\r\n", data.len());
 
         self.flash.write(ADDR_OFFSET, data).await.unwrap();
+
+        crate::psram::after_flash_write();
 
         log_storage!("SysEx Write: Done.\r\n");
     }
