@@ -12,11 +12,17 @@ pub static AUDIO_QUEUE_MIN: AtomicU32 = AtomicU32::new(u32::MAX);
 
 pub const SAMPLE_RATE: f32 = 48000.0;
 // BLE statics (CYW43 state + TrouBLE HostResources) cost ~34 KB of static RAM.
-// At 400 KB the main ARM stack (between BSS top and 0x20080000) has ~45 KB
-// of headroom, which the CYW43 firmware-loading and TrouBLE init paths need.
-// Going above ~410 KB shrinks the main stack to <20 KB and the device stops
-// enumerating USB (silent main-stack overflow).
-pub const HEAP_SIZE: usize = 400000;
+// The main ARM stack lives between BSS top and 0x20080000 and needs ~45 KB of
+// headroom for the CYW43 firmware-loading and TrouBLE init paths (going too high
+// caused a silent main-stack overflow that stopped USB enumerating).
+//
+// Two changes reclaimed room: the delay ring buffers now live in PSRAM (see
+// PsramDelay), freeing ~115 KB of heap usage; and ~78 KB of hot code
+// (cyw43 + infinitedsp_core DSP chain + libm) is relocated to RAM (.ram_code) to
+// keep instruction fetch off the QMI bus. The heap is cut from 400 KB to 256 KB
+// to pay for the relocated code while keeping stack headroom:
+// BSS(~64 KB) + heap(256 KB) + .ram_code(~78 KB) + .data leaves ~100 KB of stack.
+pub const HEAP_SIZE: usize = 256000;
 pub const BLOCK_SIZE: usize = 256;
 pub const CORE1_STACK_SIZE: usize = 16384;
 

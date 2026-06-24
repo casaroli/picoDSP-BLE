@@ -8,6 +8,7 @@ mod common;
 mod control;
 mod data;
 mod dsp;
+mod psram;
 mod tasks;
 mod usb;
 
@@ -52,6 +53,29 @@ fn init_heap() {
     }
 }
 
+// Symbols from the `.ram_code` section in memory.x (cyw43/cyw43_pio text placed
+// in RAM with a FLASH load address).
+unsafe extern "C" {
+    static __sram_code_start: u8;
+    static __sram_code_end: u8;
+    static __sram_code_load: u8;
+}
+
+/// Copy the RAM-resident cyw43 code from its FLASH load address into SRAM.
+/// MUST run before any cyw43 code executes (i.e. before the BT task spawns).
+fn init_ram_code() {
+    unsafe {
+        let start = &raw const __sram_code_start as usize;
+        let end = &raw const __sram_code_end as usize;
+        let load = &raw const __sram_code_load as usize;
+        let len = end - start;
+        core::ptr::copy_nonoverlapping(load as *const u8, start as *mut u8, len);
+        // Ensure the copied instructions are visible before they're fetched.
+        cortex_m::asm::dsb();
+        cortex_m::asm::isb();
+    }
+}
+
 // #[unsafe(link_section = ".sram4")]
 static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 
@@ -63,7 +87,21 @@ async fn main(spawner: Spawner) {
     disable_denormals();
 
     init_heap();
+    // Relocate cyw43 code into SRAM before anything touches the radio.
+    init_ram_code();
     let p = embassy_rp::init(Default::default());
+
+    // Bring up external PSRAM (APS6404L, 8 MiB on QMI CS1 / GPIO47) before core1
+    // is spawned, then validate it. The init pauses core1 internally (a no-op
+    // here since it isn't running yet) and runs from RAM, so flash XIP is safe.
+    let psram_region = psram::init(p.QMI_CS1, p.PIN_47);
+    if psram::self_test(&psram_region).is_err() {
+        defmt::panic!("PSRAM self-test failed — refusing to continue");
+    }
+    psram::bench(&psram_region);
+    // Arm the PSRAM bump allocator before spawning core1 so its build_synth can
+    // back the delay ring buffers with PSRAM.
+    psram::init_alloc(&psram_region);
 
     let flash = Flash::new(p.FLASH, p.DMA_CH0, Irqs);
     let mut storage = Storage::new(flash);

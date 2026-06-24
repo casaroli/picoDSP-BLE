@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use embassy_time::Instant;
 use infinitedsp_core::FrameProcessor;
 use infinitedsp_core::core::audio_param::AudioParam;
-use infinitedsp_core::core::channels::{DualMono, Stereo};
+use infinitedsp_core::core::channels::{DualMono, Mono, Stereo};
 use infinitedsp_core::core::dsp_chain::DspChain;
 use infinitedsp_core::core::parallel_mixer::ParallelMixer;
 use infinitedsp_core::effects::time::delay::Delay;
@@ -21,7 +21,13 @@ use crate::common::shared::{
 };
 use crate::control::midi::MidiControl;
 use crate::dsp::moog::new_moog_voice;
+use crate::dsp::psram_delay::PsramDelay;
 use crate::usb::logger::{LOG_CHANNEL, LogData, SYSTEM_STATUS_CHANNEL};
+
+/// Prototype toggle: back the two delay ring buffers with PSRAM (`true`) or the
+/// SRAM heap via the stock `Delay` (`false`). Flip to A/B the peak per-buffer
+/// DSP time and isolate the cost of routing delay traffic over the QMI bus.
+const USE_PSRAM_DELAY: bool = true;
 
 macro_rules! log_status {
     ($($arg:tt)*) => {
@@ -40,27 +46,42 @@ fn build_synth(
 ) -> impl FrameProcessor<Stereo> + Send {
     let voice = new_moog_voice(SAMPLE_RATE, midi_control, preset);
 
+    // Rewind the PSRAM bump allocator before (re)building so preset switches
+    // reuse the same region instead of leaking it. Safe because the previous
+    // synth (holding the old PSRAM slices) is dropped before build_synth runs.
+    crate::psram::reset_alloc();
+
     let d = &preset.delay;
     let time_l = d.time;
     let time_r = d.time * 1.15;
 
-    // Delay::new hardcodes 44100 Hz; pre-size to actual rate now while the heap
-    // is still unfragmented, avoiding a failed realloc inside DspChain::and().
-    let mut delay_l = Delay::new(
-        0.3,
-        AudioParam::Static(time_l),
-        AudioParam::Static(d.feedback),
-        AudioParam::Static(d.mix),
+    defmt::info!(
+        "build_synth: delay enabled={} backend={}",
+        d.enabled != 0,
+        if USE_PSRAM_DELAY { "PSRAM" } else { "SRAM" }
     );
-    delay_l.set_sample_rate(SAMPLE_RATE);
 
-    let mut delay_r = Delay::new(
-        0.3,
-        AudioParam::Static(time_r),
-        AudioParam::Static(d.feedback),
-        AudioParam::Static(d.mix),
-    );
-    delay_r.set_sample_rate(SAMPLE_RATE);
+    // Both arms are boxed so the chain type is identical regardless of backend;
+    // the vtable dispatch is once per 256-sample block (not per sample), so the
+    // A/B delta is purely the buffer location. Delay::new hardcodes 44100 Hz, so
+    // the SRAM arm pre-sizes to the real rate to avoid a realloc inside `.and()`.
+    let make_delay = |time: f32| -> Box<dyn FrameProcessor<Mono> + Send> {
+        if USE_PSRAM_DELAY {
+            Box::new(PsramDelay::new(0.3, time, d.feedback, d.mix, SAMPLE_RATE))
+        } else {
+            let mut dl = Delay::new(
+                0.3,
+                AudioParam::Static(time),
+                AudioParam::Static(d.feedback),
+                AudioParam::Static(d.mix),
+            );
+            dl.set_sample_rate(SAMPLE_RATE);
+            Box::new(dl)
+        }
+    };
+
+    let delay_l = make_delay(time_l);
+    let delay_r = make_delay(time_r);
 
     let delay_node = ParallelMixer::new(1.0, DualMono::new(delay_l, delay_r));
     let delay_bypass = Bypass::new(delay_node, d.enabled != 0);
@@ -175,6 +196,18 @@ pub async fn core1_task(midi_control: Arc<MidiControl>, initial_preset: Preset, 
                 underruns,
                 queue_min: if queue_min == u32::MAX { 0 } else { queue_min },
             });
+
+            // Mirror the peak over defmt/RTT so it's visible under `probe-rs run`
+            // for the PSRAM-delay measurement (USB serial isn't captured there).
+            defmt::info!(
+                "Core1 peak {=u64} us / {=u64} us = {=f32} % | underruns {=u32} | delay {=str}",
+                peak_duration_us,
+                max_duration_us,
+                load,
+                underruns,
+                if USE_PSRAM_DELAY { "PSRAM" } else { "SRAM" },
+            );
+
             peak_duration_us = 0;
         }
 

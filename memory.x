@@ -83,5 +83,34 @@ SECTIONS {
     } > SRAM5
 }
 
+/* RAM-resident code: gather the hot code paths that share the QMI/XIP bus into
+ * SRAM so their instruction fetches don't contend with PSRAM data access (the
+ * dominant source of DSP timing spikes). Loaded from FLASH and copied to RAM at
+ * boot by init_ram_code() before core1 / the BT task run.
+ *
+ *  - *cyw43*           : the BLE host runner's busy-poll on core0 (also *cyw43_pio*).
+ *  - *infinitedsp_core*: the whole DSP chain on core1 — incl. monomorphised
+ *                        DspChain/ParallelMixer/Bypass glue and our own
+ *                        MoogOscillatorSection / Midi* shims, whose symbols all
+ *                        carry "infinitedsp_core" in their `impl FrameProcessor`
+ *                        type paths. (PsramDelay::process is already RAM-resident
+ *                        via .data.ram_func.)
+ *  - *libm*            : per-sample expf (ADSR) and sinf (LFO) range reduction.
+ *
+ * NOTE: only .text is gathered; rodata jump tables (.Lswitch.table.*) stay in
+ * flash, a small residual. */
+SECTIONS {
+    .ram_code : ALIGN(4) {
+        . = ALIGN(4);
+        __sram_code_start = .;
+        *(.text.*cyw43*)
+        *(.text.*infinitedsp_core*)
+        *(.text.*libm*)
+        . = ALIGN(4);
+        __sram_code_end = .;
+    } > RAM AT > FLASH
+    __sram_code_load = LOADADDR(.ram_code);
+} INSERT AFTER .data;
+
 PROVIDE(start_to_end = __end_block_addr - __start_block_addr);
 PROVIDE(end_to_start = __start_block_addr - __end_block_addr);
