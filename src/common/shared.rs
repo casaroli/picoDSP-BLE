@@ -3,11 +3,17 @@ use core::sync::atomic::{AtomicBool, AtomicU32};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 
-/// Set by core0 after a flash erase/program completes. A flash op corrupts a few
-/// already-stored words of the PSRAM-backed delay buffer (and the corruption then
-/// recirculates through the delay feedback), so core1 must rebuild the synth to
-/// re-zero the delay buffer once the flash op is done. See [`crate::psram::reinit`].
-pub static SYNTH_RESET_REQ: AtomicBool = AtomicBool::new(false);
+/// Set by core1 once its DSP loop is running. Lets core0 know whether to wait for a
+/// `PSRAM_GATE_ACK` (it never comes if core1 hasn't started, e.g. the boot self-test).
+pub static CORE1_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Cross-core gate around a flash write. The PSRAM-backed delay buffer shares the QMI
+/// bus with flash, and a flash op clobbers the CS1 config and has a post-op recovery
+/// window, so core1 must not touch PSRAM during the write + reconfigure. core0 sets
+/// `PSRAM_GATE_REQ` and waits for core1 to park and raise `PSRAM_GATE_ACK` before
+/// starting the flash op; it clears `PSRAM_GATE_REQ` once the PSRAM is reconfigured.
+pub static PSRAM_GATE_REQ: AtomicBool = AtomicBool::new(false);
+pub static PSRAM_GATE_ACK: AtomicBool = AtomicBool::new(false);
 
 /// Count of audio-output underruns (AUDIO_CHANNEL found empty when core0 needed a block).
 /// A nonzero value is a click/stutter; this is the metric that actually matters, not the

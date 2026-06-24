@@ -17,7 +17,7 @@ use embassy_rp::clocks;
 use embassy_rp::peripherals::{PIN_47, QMI_CS1};
 use embassy_rp::psram::{Config, Psram};
 use embassy_rp::qmi_cs1::QmiCs1;
-use embassy_time::Instant;
+use embassy_time::{Duration, Instant, block_for};
 
 /// Cached, memory-mapped base of QMI CS1 (PSRAM) on RP2350.
 /// Kept for the next phase (placing DSP buffers in PSRAM).
@@ -91,20 +91,62 @@ pub fn init(qmi_cs1: Peri<'static, QMI_CS1>, cs1_pin: Peri<'static, PIN_47>) -> 
     }
 }
 
-/// Handle the fallout of a flash erase/program. Call this on core0 immediately
-/// after any flash write completes.
-///
-/// A flash op has two effects on the PSRAM, which shares the QMI with the flash:
-///  1. It clobbers the CS1 controller config (the bootrom `flash_enter_cmd_xip`
-///     only restores CS0), so PSRAM access must be re-established — [`reinit`].
-///  2. It corrupts a handful of already-stored words in PSRAM (the APS6404 is
-///     pseudo-static and the long erase disturbs it; reads/writes themselves stay
-///     fine afterwards). For the delay this is fatal: the corrupt samples
-///     recirculate through its feedback into sustained noise. So we ask core1 to
-///     rebuild the synth, which re-zeros the delay buffer and clears it.
+/// Lock core1 off the PSRAM for the duration of a flash write + reconfigure, then
+/// release with [`unlock_core1`]. The PSRAM-backed delay buffer shares the QMI bus
+/// with flash; a flash op clobbers the CS1 config and leaves a post-op recovery
+/// window, so core1 must not touch PSRAM across the whole sequence. We request the
+/// park and `await` core1's ack — async (not a busy spin) so core0's executor keeps
+/// draining the audio channel; otherwise core1 could block in `AUDIO_CHANNEL.send`
+/// and never reach the loop top to ack (deadlock). If core1 isn't running yet (boot
+/// self-test) no ack will come, so we don't wait.
+pub async fn lock_core1_off_psram() {
+    use crate::common::shared::{CORE1_RUNNING, PSRAM_GATE_ACK, PSRAM_GATE_REQ};
+    PSRAM_GATE_REQ.store(true, Ordering::Release);
+    if CORE1_RUNNING.load(Ordering::Acquire) {
+        while !PSRAM_GATE_ACK.load(Ordering::Acquire) {
+            embassy_time::Timer::after(Duration::from_micros(50)).await;
+        }
+    }
+}
+
+/// Release core1 after a flash write + reconfigure (see [`lock_core1_off_psram`]).
+/// Call only after [`after_flash_write`] has restored the CS1 config, so core1
+/// resumes with valid PSRAM access.
+pub fn unlock_core1() {
+    crate::common::shared::PSRAM_GATE_REQ.store(false, Ordering::Release);
+}
+
+/// Settle the PSRAM and fully re-init the CS1 controller after a flash erase/program,
+/// preserving prior PSRAM contents. Caller must have core1 parked
+/// ([`lock_core1_off_psram`]) so the PSRAM is idle through the recovery window.
 pub fn after_flash_write() {
+    // Two ingredients are required together (see
+    // docs/psram-flash-corruption-investigation.md):
+    //   1. a short IDLE SETTLE after the flash op — accessing PSRAM too soon corrupts a
+    //      handful of already-stored words (0 ms -> ~20 corrupt, 100 µs -> 0; we use a
+    //      comfortable 1 ms, dwarfed by the tens of ms the erase already stalls audio);
+    //   2. a FULL `reinit()` (Psram::new: chip reset 0xf5 / re-detect / re-enter QPI 0x35
+    //      / M1 regs) — re-applying just the clobbered M1 registers after the settle is
+    //      NOT enough (measured 28 corrupt words); the chip-level re-init is what makes
+    //      the content survive.
+    block_for(Duration::from_millis(1));
     reinit();
-    crate::common::shared::SYNTH_RESET_REQ.store(true, Ordering::Release);
+    // reinit + settle preserves prior PSRAM contents, so there's nothing to rebuild —
+    // the old SYNTH_RESET_REQ delay-rezero path is gone.
+}
+
+/// Re-establish PSRAM access after a flash op clobbered the CS1 config. Re-runs the
+/// full embassy init (chip reset 0xf5, re-detect, re-enter QPI 0x35, reconfigure M1).
+/// `Psram::new` pauses core1 and runs its timing-critical parts from RAM, so it's
+/// safe to call from flash. The peripherals were consumed at boot, so steal them
+/// back — we statically know nothing else owns QMI CS1 / GPIO47.
+pub fn reinit() {
+    boost_qspi_pads();
+    let cs1 = QmiCs1::new(unsafe { QMI_CS1::steal() }, unsafe { PIN_47::steal() });
+    match Psram::new(cs1, psram_config()) {
+        Ok(_) => info!("PSRAM: re-init after flash op OK"),
+        Err(e) => defmt::error!("PSRAM re-init after flash failed: {:?}", e),
+    }
 }
 
 /// Set the shared QSPI data pads (SCLK + SD0..3) to max drive / fast slew.
@@ -120,20 +162,6 @@ fn boost_qspi_pads() {
         });
     }
     cortex_m::asm::dsb();
-}
-
-/// Re-establish PSRAM access after a flash op clobbered the CS1 config. Re-runs the
-/// full embassy init (chip reset 0xf5, re-detect, re-enter QPI 0x35, reconfigure M1).
-/// `Psram::new` pauses core1 and runs its timing-critical parts from RAM, so it's
-/// safe to call from flash. The peripherals were consumed at boot, so steal them
-/// back — we statically know nothing else owns QMI CS1 / GPIO47.
-pub fn reinit() {
-    boost_qspi_pads();
-    let cs1 = QmiCs1::new(unsafe { QMI_CS1::steal() }, unsafe { PIN_47::steal() });
-    match Psram::new(cs1, psram_config()) {
-        Ok(_) => info!("PSRAM: re-init after flash op OK"),
-        Err(e) => defmt::error!("PSRAM re-init after flash failed: {:?}", e),
-    }
 }
 
 // --- Minimal bump allocator over PSRAM ------------------------------------

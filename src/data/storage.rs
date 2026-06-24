@@ -61,6 +61,9 @@ impl<'d> Storage<'d> {
     pub async fn format(&mut self) {
         log_storage!("Formatting storage area...\r\n");
 
+        // Park core1 off PSRAM for the whole flash write + reconfigure.
+        crate::psram::lock_core1_off_psram().await;
+
         self.flash
             .erase(ADDR_OFFSET, ADDR_OFFSET + ERASE_SIZE as u32)
             .await
@@ -92,6 +95,7 @@ impl<'d> Storage<'d> {
 
         self.flash.write(ADDR_OFFSET, &sector_buf).await.unwrap();
         crate::psram::after_flash_write();
+        crate::psram::unlock_core1();
         log_storage!("Formatted and wrote defaults.\r\n");
     }
 
@@ -135,6 +139,10 @@ impl<'d> Storage<'d> {
     }
 
     pub async fn write_raw(&mut self, data: &[u8]) {
+        // Park core1 off PSRAM for the whole flash write + reconfigure (the delay buffer
+        // shares the QMI bus with flash), then release once PSRAM is reconfigured.
+        crate::psram::lock_core1_off_psram().await;
+
         log_storage!("SysEx Write: Erasing sector...\r\n");
         self.flash
             .erase(ADDR_OFFSET, ADDR_OFFSET + ERASE_SIZE as u32)
@@ -146,6 +154,7 @@ impl<'d> Storage<'d> {
         self.flash.write(ADDR_OFFSET, data).await.unwrap();
 
         crate::psram::after_flash_write();
+        crate::psram::unlock_core1();
 
         log_storage!("SysEx Write: Done.\r\n");
     }

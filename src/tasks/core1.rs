@@ -16,8 +16,9 @@ use infinitedsp_core::effects::utility::stereo_widener::StereoWidener;
 
 use crate::HEAP;
 use crate::common::shared::{
-    AUDIO_CHANNEL, AUDIO_QUEUE_MIN, AUDIO_UNDERRUNS, AudioData, BLOCK_SIZE, CORE1_STACK_SIZE,
-    PRESET_CHANNEL, SAMPLE_RATE, SYNTH_RESET_REQ, disable_denormals,
+    AUDIO_CHANNEL, AUDIO_QUEUE_MIN, AUDIO_UNDERRUNS, AudioData, BLOCK_SIZE, CORE1_RUNNING,
+    CORE1_STACK_SIZE, PRESET_CHANNEL, PSRAM_GATE_ACK, PSRAM_GATE_REQ, SAMPLE_RATE,
+    disable_denormals,
 };
 use crate::control::midi::MidiControl;
 use crate::dsp::moog::new_moog_voice;
@@ -137,10 +138,6 @@ pub async fn core1_task(midi_control: Arc<MidiControl>, initial_preset: Preset, 
     midi_control.set_portamento(initial_preset.portamento);
     log_status!("Core 1: Heap free before build: {} KB\r\n", HEAP.free() / 1024);
 
-    // Retained so we can rebuild the synth (and re-zero the PSRAM delay buffer) after
-    // a flash write corrupts it — see SYNTH_RESET_REQ.
-    let mut current_preset = initial_preset;
-
     let mut synth: Option<Box<dyn FrameProcessor<Stereo> + Send>> =
         Some(Box::new(build_synth(midi_control.clone(), initial_preset)));
 
@@ -159,28 +156,34 @@ pub async fn core1_task(midi_control: Arc<MidiControl>, initial_preset: Preset, 
     // instantaneous sample almost always misses; the peak is the number that matters.
     let mut peak_duration_us: u64 = 0;
 
+    // Announce we're live so core0 knows to wait for our park-ack around flash writes.
+    CORE1_RUNNING.store(true, Ordering::Release);
+
     loop {
+        // Park off PSRAM while core0 does a flash write + PSRAM reconfigure. The delay
+        // buffer lives in PSRAM (shared QMI bus with flash), so running the synth during
+        // a flash op would hit the clobbered CS1 config / post-op recovery window. We ack
+        // that we've stopped touching PSRAM, then spin until core0 releases us. Output
+        // underruns to silence meanwhile — same brief glitch a save already causes.
+        if PSRAM_GATE_REQ.load(Ordering::Acquire) {
+            PSRAM_GATE_ACK.store(true, Ordering::Release);
+            while PSRAM_GATE_REQ.load(Ordering::Acquire) {
+                cortex_m::asm::nop();
+            }
+            PSRAM_GATE_ACK.store(false, Ordering::Release);
+            continue;
+        }
+
         if let Ok(new_preset) = PRESET_CHANNEL.try_receive() {
             log_status!("Core 1: Switching Preset...\r\n");
             let _ = synth.take();
             print_stats(stack_ptr).await;
-            current_preset = new_preset;
             midi_control.set_portamento(new_preset.portamento);
 
             synth = Some(Box::new(build_synth(midi_control.clone(), new_preset)));
 
             log_status!("Core 1: Preset Switched.\r\n");
             print_stats(stack_ptr).await;
-        }
-
-        // A flash write (preset save) corrupts a few words of the PSRAM-backed delay
-        // buffer; rebuild the synth so the buffer is re-zeroed and the corruption
-        // stops recirculating through the delay feedback. (core0 already re-init'd
-        // the PSRAM controller config before setting this.)
-        if SYNTH_RESET_REQ.swap(false, Ordering::AcqRel) {
-            let _ = synth.take();
-            synth = Some(Box::new(build_synth(midi_control.clone(), current_preset)));
-            log_status!("Core 1: Delay rebuilt after flash write.\r\n");
         }
 
         let start_time = Instant::now();

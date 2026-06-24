@@ -1,6 +1,87 @@
 # PSRAM data corruption after flash writes — investigation log
 
-Status: **open problem, partial workaround in place.**
+Status (2026-06-25): **delay use-case fixed; bit-perfect preservation still open.**
+A ~1 ms *idle settle* + full `Psram::new` re-init after the flash op, with core1 parked
+off PSRAM for the whole write, makes the PSRAM-backed **delay** survive a save with **clean
+audio (live-confirmed)**. But the single-core boot harness still reads **~20–28 corrupt
+words/8192 on the first flash op after boot** (varies run-to-run) — so content is **not yet
+bit-perfect**. Fine for disposable/self-healing data (the delay washes it out through
+feedback); **not yet safe for non-disposable data** (samples, wavetables, looper). The
+remaining residual is the open problem — see [§9 Open residual](#9-open-residual--what-to-investigate-next).
+
+## RESOLUTION (2026-06-25)
+
+The corruption was **not** content lost during the erase. It's a **recovery-window**
+effect: if PSRAM is accessed *too soon* after a flash erase/program, a handful of
+already-stored words read back corrupt (high-16-bits-zeroed). The fix needs **two**
+ingredients together; either alone is insufficient.
+
+**Ingredient 1 — a short idle settle after the flash op.** Hardware sweep (single-core
+boot harness, full `Psram::new` reinit in place, delay inserted *after* the flash op and
+*before* the reinit/read):
+
+| post-flash settle (with full reinit) | corrupt words / 8192 |
+|---|---|
+| 0 µs (old behaviour) | **22** |
+| 100 µs | **0** |
+| 1 ms | **0** |
+| 10 ms | **0** |
+
+A delay *after* the erase cannot un-decay a cell, which rules out the old
+"refresh-decay-during-erase" hypothesis (§3b) — the bits aren't lost during the erase,
+they're misread if you touch the part during its post-op recovery window.
+
+**Ingredient 2 — a full `Psram::new` re-init, not just a register restore.** We tried
+replacing the full re-init with a lightweight CS1 M1-register snapshot/restore (the chip
+keeps QPI mode across a flash op, so in principle only the QMI M1 registers are clobbered,
+§3a). With the 1 ms settle but *only* the register restore, the boot harness still read
+**28 corrupt words** — config was correct (28 is the content-corruption signature, not a
+config failure) but content was not preserved. So the chip-level direct-mode activity
+inside `Psram::new` (reset-enable 0xf5, read-id 0x9f, re-enter-QPI 0x35, CS1 toggling) is
+itself part of what makes the content survive. This also corrects §4 #1: register-restore
+is insufficient *with or without* the settle.
+
+**The shipped fix:**
+- `psram::after_flash_write()` = `block_for(1 ms)` (idle settle) → `reinit()` (full
+  `Psram::new`). 1 ms is comfortable margin over the 100 µs that worked, dwarfed by the
+  tens of ms the erase already stalls audio.
+- **core1 gate** so PSRAM is genuinely idle for the *whole* flash write, not just the
+  settle. Embassy's flash driver pauses core1 only around each erase/program RAM op and
+  resumes it in the gaps between them — where core1's DSP loop would touch the
+  PSRAM-backed delay buffer with the CS1 config still clobbered. We can't wrap those ops
+  in an outer `pause_core1` (core1's pause-spin discards a second PAUSE token → nested
+  FIFO pause deadlocks), and core0 can't busy-wait for core1 (it would starve the I2S
+  consumer and deadlock core1 in `AUDIO_CHANNEL.send().await`). So instead a cooperative
+  gate: `storage` calls `psram::lock_core1_off_psram().await` (sets `PSRAM_GATE_REQ`,
+  async-waits core1's `PSRAM_GATE_ACK`) before the erase, and `psram::unlock_core1()`
+  after the reinit. core1 checks the gate at the top of its loop, parks (stops touching
+  PSRAM, output underruns to silence) and acks until released. `CORE1_RUNNING` lets core0
+  skip the ack-wait when core1 isn't up yet (boot self-test). `reinit()`'s internal
+  `pause_core1` still works on the parked-in-thread core1 (no nesting — the gate spin runs
+  with interrupts enabled).
+
+One piece of the old workaround was removed as no longer needed: the synth rebuild / delay
+re-zero (`SYNTH_RESET_REQ`) — content is preserved now, so there's nothing to rebuild.
+(Removed from `psram.rs`, `tasks/core1.rs`, `shared.rs`.)
+
+**Confirmed:** live play + save-preset test reports clean audio.
+
+**Caveat — single-core residual:** the boot verification harness in `main.rs`
+(sentinel → flash write → settle+reinit → read) runs *before* core1 spawns, so it
+measures only the inherent recovery-window residual, which still shows ~20 corrupt words
+on some runs (run-to-run variance; an earlier sweep happened to read 0 on later flash ops
+of the same boot). This is inaudible for the delay (small, washes out through feedback),
+but means **content preservation is not yet bit-perfect** — revisit (longer settle?
+repeated reinit? first-op-after-boot effect?) before trusting PSRAM with non-disposable
+data (samples, wavetables, looper). The core1 gate does not change this number (it's
+single-core); it hardens the *production* path so core1 never reads clobbered PSRAM.
+
+---
+
+## Original investigation (pre-resolution)
+
+The notes below predate the resolution above; the "open problem" framing in §6 and the
+"content genuinely lost" conclusion in §3b/§4 are **superseded** by the RESOLUTION.
 
 A flash erase/program corrupts a small amount of *already-stored* PSRAM content.
 For the delay buffer this is masked by a workaround (rebuild → re-zero the buffer),
@@ -237,13 +318,64 @@ Useful registers: `embassy_rp::pac::QMI.mem(1).{timing,rfmt,rcmd,wfmt,wcmd}()`,
 (n: 0=SCLK, 1–4=SD0–3, 5=SS). A `dump_m1(tag)` helper that logged all five M1 registers +
 `writable_m1` produced the §3a table; re-add it if you need to compare config states.
 
-## 8. Key code locations
+## 8. Key code locations (current, post-resolution)
 
-- `src/psram.rs` — `init`, `reinit`, `after_flash_write`, `boost_qspi_pads`, bump allocator.
+- `src/psram.rs` — `init` (+ snapshot was removed), `reinit` (full `Psram::new`),
+  `after_flash_write` (`block_for(1 ms)` + `reinit`), `lock_core1_off_psram` /
+  `unlock_core1` (the core1 gate), `boost_qspi_pads`, bump allocator.
+- `src/data/storage.rs` — flash storage; `write_raw` / `format` now bracket the flash op
+  with `lock_core1_off_psram().await` … `after_flash_write()` … `unlock_core1()`.
+- `src/tasks/core1.rs` — gate park at the top of the DSP loop (`PSRAM_GATE_REQ` →
+  ack `PSRAM_GATE_ACK` → spin); sets `CORE1_RUNNING` at task start.
+- `src/common/shared.rs` — `CORE1_RUNNING`, `PSRAM_GATE_REQ`, `PSRAM_GATE_ACK`.
+  (`SYNTH_RESET_REQ` removed — the old synth-rebuild/delay-rezero workaround is gone.)
 - `src/dsp/psram_delay.rs` — PSRAM-backed delay (`process` is RAM-resident).
-- `src/data/storage.rs` — flash storage; calls `after_flash_write()` after writes.
-- `src/tasks/core1.rs` — `SYNTH_RESET_REQ` handling (rebuild → re-zero delay).
-- `src/common/shared.rs` — `SYNTH_RESET_REQ`.
+- `src/main.rs` — boot **verification harness** ("PSRAM across-flash verify", ~L120–150),
+  single-core, kept for investigating the residual. Remove when done.
 - `src/flash_diag.rs` — read-only QMI CS0 (flash) XIP config / rxdelay sweep diagnostics.
 - Reference: `embassy-rp-0.10.0/src/{psram.rs,qmi_cs1.rs,flash.rs}`; MicroPython
   `rp2_psram.c` (original driver lineage).
+
+## 9. Open residual — what to investigate next
+
+**What's solved:** the delay survives a save with clean audio (live-confirmed). Mechanism
+is a post-flash **recovery window**, not erase-time decay; the cure is **idle settle (≥100 µs,
+we use 1 ms) + full `Psram::new` re-init** (register-only restore is NOT enough — §RESOLUTION
+ingredient 2), with **core1 gated off PSRAM** for the whole write (§RESOLUTION).
+
+**What's NOT solved:** the single-core boot harness still reports **~20–28 corrupt words /
+8192** on the **first** flash op after boot. Latest runs: 20, then 28 (register-only restore),
+then 20, then 24. So settle + full reinit is *not* reliably bit-perfect — yet the audio is
+clean because the delay's feedback washes out a few corrupt samples.
+
+**The central open question:** why did the original §RESOLUTION sweep read **0** at 100 µs /
+1 ms / 10 ms, but the standalone harness reads ~20–28 at 1 ms? The leading suspect is a
+**first-flash-op-after-boot effect**: in the sweep the 0-results were the *2nd/3rd* flash op
+of the boot (the 1st, at 0 µs, read 22); the standalone harness measures only the *1st* op.
+If true, the very first post-boot erase/program leaves PSRAM in a state that one settle+reinit
+doesn't fully clear.
+
+**Concrete next experiments (single-core boot harness, cheap to run):**
+1. **Repeat the harness flash op 3–5× in one boot**, logging the corrupt count each time.
+   If it's high on op 1 and drops to 0 on op 2+, the first-op-after-boot hypothesis holds and
+   the fix may be a one-time warm-up (a dummy erase/settle/reinit at init) or a 2nd reinit.
+2. **Sweep the settle longer on op 1**: 1 ms vs 5 / 10 / 50 / 100 ms. Does op-1 residual fall
+   to 0 with a longer first settle? (Distinguishes "needs more time" from "needs warm-up".)
+3. **Double reinit**: settle → `reinit()` → short settle → `reinit()` again. Does a second
+   chip-level re-init scrub the residual? (Cheap; tests whether one reinit is just incomplete.)
+4. **Log the corrupt addresses** (not just the count) across several op-1 runs: fixed rows/
+   pages/banks vs uniformly scattered? Points at the mechanism (refresh region vs random).
+5. **Erase-only vs program-only**: does the residual track the long erase or the short
+   program? (Wire a path that does just one.)
+6. **Reference behaviour**: how do MicroPython `rp2_psram` + its flash FS, or pico-sdk PSRAM
+   examples, sequence the *first* PSRAM touch after a flash op — do they warm up / double-init?
+7. **RP2350 datasheet/errata**: QMI flash+PSRAM coexistence, APS6404 `tCEM` / refresh, and
+   what `flash_exit_xip`/direct mode do to the shared clock while CS1 is idle.
+
+Until the residual is 0, **do not store non-disposable data in PSRAM**. For disposable/
+self-healing data (the delay) the current fix is sufficient. If bit-perfect proves hard,
+fall back to ECC/checksum + a flash-backed copy and repair the few corrupt words after each
+flash op (§6 "quiesce + checksum").
+
+The repro harness is live in `main.rs` — flash a build and read the
+`PSRAM across-flash verify: pre N/8192 post M/8192` line. `post` is the residual.

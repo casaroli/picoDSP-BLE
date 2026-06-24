@@ -115,6 +115,46 @@ async fn main(spawner: Spawner) {
     let mut storage = Storage::new(flash);
     storage.init().await;
 
+    // --- PSRAM-across-flash verification (remove once confirmed) --------------
+    // Sentinel -> non-destructive flash erase+write -> after_flash_write() (1 ms
+    // idle settle + lightweight CS1 register restore) -> read back. Expect 0
+    // mismatches: PSRAM content now survives a flash write. Runs single-core
+    // before core1 spawns, so nothing else touches PSRAM during the check.
+    {
+        let base = psram_region.base() as *mut u32; // cached CS1 = 0x1100_0000
+        let n = 16384usize; // write 64 KiB (> 16 KiB XIP cache)
+        let check = 8192usize; // verify first 32 KiB (genuinely evicted to PSRAM)
+        let pat = |i: usize| 0xC0DE_0000u32.wrapping_add(i as u32);
+        let count = |p: *mut u32| -> usize {
+            let mut m = 0;
+            for i in 0..check {
+                if unsafe { core::ptr::read_volatile(p.add(i)) } != pat(i) {
+                    m += 1;
+                }
+            }
+            m
+        };
+
+        for i in 0..n {
+            unsafe { core::ptr::write_volatile(base.add(i), pat(i)) };
+        }
+        cortex_m::asm::dsb();
+        let pre = count(base);
+
+        let mut sector = [0u8; 4096];
+        storage.read_raw(&mut sector).await;
+        storage.write_raw(&sector).await; // -> after_flash_write(): settle + restore
+
+        let post = count(base);
+        defmt::info!(
+            "PSRAM across-flash verify: pre {}/{} post {}/{} (expect 0/0)",
+            pre,
+            check,
+            post,
+            check
+        );
+    }
+
     let preset = storage
         .load_preset(4)
         .await
