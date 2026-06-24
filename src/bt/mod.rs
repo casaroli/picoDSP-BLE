@@ -15,8 +15,9 @@ use embassy_futures::join::join;
 use embassy_futures::select::select;
 use embassy_rp::Peri;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{DMA_CH2, PIN_23, PIN_24, PIN_25, PIN_29, PIO1};
+use embassy_rp::peripherals::{DMA_CH2, PIN_23, PIN_24, PIN_25, PIN_29, PIO1, TRNG};
 use embassy_rp::pio::Pio;
+use embassy_rp::trng::Trng;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
@@ -153,6 +154,49 @@ fn parse_ble_midi(packet: &[u8]) {
     }
 }
 
+/// Pair (encrypt) the link using JustWorks security and wait for it to complete.
+///
+/// BLE-MIDI keyboards typically guard the MIDI I/O characteristic behind an encrypted link
+/// (the CCCD subscribe otherwise returns ATT 0x05, Insufficient Authentication). Returns
+/// `true` once the link is encrypted, `false` if pairing failed or the connection dropped.
+async fn pair<C: Controller>(
+    stack: &Stack<'_, C, DefaultPacketPool>,
+    conn: &Connection<'_, DefaultPacketPool>,
+) -> bool {
+    // Request *bonding* (not just an ephemeral pairing): keyboards generally reject a
+    // NoBonding pairing request, which surfaces as the peer sending PairingFailed.
+    if let Err(e) = conn.set_bondable(true) {
+        warn!("[bt] set_bondable failed: {:?}", e);
+        return false;
+    }
+    if let Err(e) = conn.request_security() {
+        warn!("[bt] request_security failed: {:?}", e);
+        return false;
+    }
+    loop {
+        match conn.next().await {
+            ConnectionEvent::PairingComplete { security_level, .. } => {
+                info!("[bt] paired (security level {:?})", security_level);
+                return true;
+            }
+            ConnectionEvent::PairingFailed(err) => {
+                warn!("[bt] pairing failed: {:?}", err);
+                return false;
+            }
+            ConnectionEvent::Disconnected { reason } => {
+                warn!("[bt] disconnected during pairing: {:?}", reason);
+                return false;
+            }
+            // The keyboard may ask to relax the connection parameters mid-pairing; accept
+            // its preferred values so the link stays up.
+            ConnectionEvent::RequestConnectionParams(req) => {
+                let _ = req.accept(None, stack).await;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Discover the MIDI service/characteristic over an established connection, subscribe to
 /// notifications and pump them into [`parse_ble_midi`] until the link drops.
 async fn run_gatt<C: Controller>(
@@ -173,8 +217,8 @@ async fn run_gatt<C: Controller>(
             .await
         {
             Ok(s) => s,
-            Err(_) => {
-                warn!("[bt] service discovery failed");
+            Err(e) => {
+                warn!("[bt] service discovery failed: {:?}", e);
                 return;
             }
         };
@@ -187,15 +231,15 @@ async fn run_gatt<C: Controller>(
             .await
         {
             Ok(c) => c,
-            Err(_) => {
-                warn!("[bt] MIDI characteristic not found");
+            Err(e) => {
+                warn!("[bt] MIDI characteristic not found: {:?}", e);
                 return;
             }
         };
         let mut listener = match client.subscribe(&ch, false).await {
             Ok(l) => l,
-            Err(_) => {
-                warn!("[bt] subscribe failed");
+            Err(e) => {
+                warn!("[bt] subscribe failed: {:?}", e);
                 return;
             }
         };
@@ -220,6 +264,7 @@ pub async fn bluetooth_task(
     clk: Peri<'static, PIN_29>,
     pio: Peri<'static, PIO1>,
     dma: Peri<'static, DMA_CH2>,
+    trng: Peri<'static, TRNG>,
 ) {
     let fw = aligned_bytes!("../../cyw43-firmware/43439A0.bin");
     let btfw = aligned_bytes!("../../cyw43-firmware/43439A0_btfw.bin");
@@ -257,8 +302,13 @@ pub async fn bluetooth_task(
         let address = Address::random([0x4d, 0x49, 0x44, 0x49, 0x01, 0xff]);
         let mut resources =
             HostResources::<_, DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>::new();
+        // Seed the security manager's CSPRNG from the RP2350 hardware TRNG (CryptoRng).
+        // We have no display or keypad, so advertise NoInputNoOutput → JustWorks pairing.
+        let mut trng = Trng::new(trng, Irqs, embassy_rp::trng::Config::default());
         let stack = trouble_host::new(controller, &mut resources)
             .set_random_address(address)
+            .set_random_generator_seed(&mut trng)
+            .set_io_capabilities(IoCapabilities::NoInputNoOutput)
             .build();
         let mut runner = stack.runner();
         let handler = MidiScanHandler::new();
@@ -309,7 +359,13 @@ pub async fn bluetooth_task(
                 match central.connect(&conn_cfg).await {
                     Ok(conn) => {
                         info!("[bt] connected");
-                        run_gatt(&stack, &conn).await;
+                        // The keyboard's MIDI characteristic requires an encrypted link, so
+                        // pair (JustWorks) before touching GATT. If pairing fails or the link
+                        // drops we fall through and rescan rather than spinning on a 0x05
+                        // (Insufficient Authentication) subscribe.
+                        if pair(&stack, &conn).await {
+                            run_gatt(&stack, &conn).await;
+                        }
                         info!("[bt] disconnected, rescanning");
                     }
                     Err(_) => warn!("[bt] connect failed"),

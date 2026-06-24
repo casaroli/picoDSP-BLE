@@ -26,7 +26,15 @@ embassy-usb-logger = { version = "0.6.0" }
 cyw43 = { version = "0.7.0", features = ["defmt", "bluetooth"] }
 cyw43-pio = { version = "0.10.0", features = ["defmt"] }
 bt-hci = { version = "0.8", features = ["defmt"] }
-trouble-host = { git = "https://github.com/embassy-rs/trouble", rev = "5c22e8d47faefeb90f0c16f03ddedf97b82fe282", features = ["defmt", "central", "gatt", "scan", "default-packet-pool"] }
+# `security` enables the SMP/pairing stack: many BLE-MIDI keyboards mark their MIDI
+# I/O characteristic as requiring an encrypted link and reject the CCCD subscribe with
+# ATT error 0x05 (Insufficient Authentication) until the central pairs. We pair with
+# JustWorks (NoInputNoOutput) + bonding and re-pair on each connection (no persisted bonds).
+# `legacy-pairing` (implies `security`) is required because the keyboard is a BLE 4.x device
+# that does NOT support LE Secure Connections; without it the central rejects the peer's
+# pairing response with ATT/SMP "Authentication requirements not met" instead of falling
+# back to LE Legacy pairing.
+trouble-host = { git = "https://github.com/embassy-rs/trouble", rev = "5c22e8d47faefeb90f0c16f03ddedf97b82fe282", features = ["defmt", "central", "gatt", "scan", "default-packet-pool", "legacy-pairing"] }
 aligned = "0.4.3"
 
 defmt = "1.0.1"
