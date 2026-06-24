@@ -250,8 +250,30 @@ async fn run_gatt<C: Controller>(
         }
     };
 
+    // Pump connection events during the playing phase: report the negotiated interval and
+    // accept any parameter-update request the keyboard initiates (so it can pull the interval
+    // lower than our 15–30 ms request if it prefers), stopping when the link drops.
+    let conn_events = async {
+        info!(
+            "[bt] connection interval {} ms",
+            conn.params().conn_interval.as_millis()
+        );
+        loop {
+            match conn.next().await {
+                ConnectionEvent::ConnectionParamsUpdated { conn_interval, .. } => {
+                    info!("[bt] connection interval now {} ms", conn_interval.as_millis());
+                }
+                ConnectionEvent::RequestConnectionParams(req) => {
+                    let _ = req.accept(None, stack).await;
+                }
+                ConnectionEvent::Disconnected { .. } => break,
+                _ => {}
+            }
+        }
+    };
+
     // `client.task()` ends when the link drops; `select` then drops `work` so we can rescan.
-    let _ = select(client.task(), work).await;
+    let _ = select(client.task(), select(work, conn_events)).await;
 }
 
 /// Core0 Bluetooth entry point: bring up CYW43, run the TrouBLE host, and keep a BLE-MIDI
@@ -349,7 +371,15 @@ pub async fn bluetooth_task(
 
                 info!("[bt] candidate found, connecting…");
                 let conn_cfg = ConnectConfig {
-                    connect_params: Default::default(),
+                    // The trouble-host default pins the connection interval at 80 ms (~12.5 Hz),
+                    // which adds up to 80 ms of MIDI latency/jitter. Request a 15–30 ms window
+                    // instead: ~3–5× lower latency while leaving the radio enough idle time that
+                    // its SPI/QMI traffic doesn't starve the core1 PSRAM DSP (audio underruns).
+                    connect_params: RequestedConnParams {
+                        min_connection_interval: Duration::from_millis(15),
+                        max_connection_interval: Duration::from_millis(30),
+                        ..Default::default()
+                    },
                     scan_config: ScanConfig {
                         active: true,
                         filter_accept_list: core::slice::from_ref(&target),
