@@ -1,9 +1,13 @@
+use core::mem;
+
 use alloc::sync::Arc;
 use embassy_executor::Spawner;
 use embassy_rp::Peri;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{PIN_25, USB};
+use embassy_rp::peripherals::{PIN_25, PIO0, USB};
+use embassy_rp::pio_programs::i2s::PioI2sOut;
 use embassy_rp::usb::Driver;
+use static_cell::StaticCell;
 
 use crate::common::shared::{AUDIO_CHANNEL, BLOCK_SIZE, HEAP_SIZE, SAMPLE_RATE};
 use crate::control::midi::{MidiControl, midi_task};
@@ -14,6 +18,7 @@ use crate::usb::logger;
 pub async fn main_task(
     spawner: Spawner,
     usb: Peri<'static, USB>,
+    mut i2s: PioI2sOut<'_, PIO0, 0>,
     pin_25: Peri<'static, PIN_25>,
     midi_control: Arc<MidiControl>,
     storage: Storage<'static>,
@@ -24,6 +29,11 @@ pub async fn main_task(
     };
 
     let led = Output::new(pin_25, Level::Low);
+
+    const BUFFER_SIZE: usize = BLOCK_SIZE;
+    static DMA_BUFFER: StaticCell<[u32; BUFFER_SIZE * 2]> = StaticCell::new();
+    let dma_buffer = DMA_BUFFER.init_with(|| [0u32; BUFFER_SIZE * 2]);
+    let (mut back_buffer, mut front_buffer) = dma_buffer.split_at_mut(BUFFER_SIZE);
 
     if let Some(device) = usb_device {
         spawner
@@ -39,56 +49,21 @@ pub async fn main_task(
             )
             .unwrap(),
         );
+    }
 
-        let mut microphone = device.microphone;
+    loop {
+        let dma_future = i2s.write(front_buffer);
 
-        let mut dsp_buffer: [f32; BLOCK_SIZE] = [0.0; BLOCK_SIZE];
-        let mut dsp_buffer_idx = BLOCK_SIZE;
+        let audio_data = AUDIO_CHANNEL.receive().await;
 
-        loop {
-            let mut usb_frames_collected = 0;
-            let mut usb_audio_bytes = [0u8; 48 * 2 * 2];
+        const I16_SCALE: f32 = i16::MAX as f32;
 
-            while usb_frames_collected < 48 {
-                if dsp_buffer_idx >= BLOCK_SIZE {
-                    let audio_data = AUDIO_CHANNEL.receive().await;
-                    dsp_buffer = audio_data.buffer;
-                    dsp_buffer_idx = 0;
-                }
-
-                if dsp_buffer_idx < BLOCK_SIZE {
-                    let available_floats = BLOCK_SIZE - dsp_buffer_idx;
-                    let available_frames = available_floats / 2;
-                    let needed_frames = 48 - usb_frames_collected;
-                    let frames_to_copy = available_frames.min(needed_frames);
-
-                    for _ in 0..frames_to_copy {
-                        let l_sample = dsp_buffer[dsp_buffer_idx];
-                        let r_sample = dsp_buffer[dsp_buffer_idx + 1];
-                        dsp_buffer_idx += 2;
-
-                        let sample_l = (l_sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-                        let sample_r = (r_sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-
-                        let bytes_l = sample_l.to_le_bytes();
-                        let bytes_r = sample_r.to_le_bytes();
-
-                        let byte_idx = usb_frames_collected * 4;
-                        usb_audio_bytes[byte_idx] = bytes_l[0];
-                        usb_audio_bytes[byte_idx + 1] = bytes_l[1];
-                        usb_audio_bytes[byte_idx + 2] = bytes_r[0];
-                        usb_audio_bytes[byte_idx + 3] = bytes_r[1];
-
-                        usb_frames_collected += 1;
-                    }
-                }
-            }
-
-            let _ = microphone.write_packet(&usb_audio_bytes).await;
+        for (dst, &sample) in back_buffer.iter_mut().zip(&audio_data.buffer) {
+            let s = (sample * I16_SCALE) as i16 as u16 as u32;
+            *dst = (s << 16) | s;
         }
-    } else {
-        loop {
-            let _ = AUDIO_CHANNEL.receive().await;
-        }
+
+        dma_future.await;
+        mem::swap(&mut back_buffer, &mut front_buffer);
     }
 }

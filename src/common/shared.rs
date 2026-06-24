@@ -3,7 +3,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 
 pub const SAMPLE_RATE: f32 = 48000.0;
-pub const HEAP_SIZE: usize = 480000;
+pub const HEAP_SIZE: usize = 440000;
 pub const BLOCK_SIZE: usize = 256;
 pub const CORE1_STACK_SIZE: usize = 16384;
 

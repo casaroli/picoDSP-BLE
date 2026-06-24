@@ -14,6 +14,8 @@ use alloc::sync::Arc;
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 use defmt::*;
+use embassy_rp::pio::Pio;
+use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
 use embassy_time::Timer;
 
 use defmt_rtt as _;
@@ -24,7 +26,7 @@ use panic_halt as _;
 use embassy_rp::bind_interrupts;
 use embassy_rp::flash::Flash;
 use embassy_rp::multicore::{Stack, spawn_core1};
-use embassy_rp::peripherals::{DMA_CH0, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, USB};
 use embassy_rp::usb::InterruptHandler;
 
 use static_cell::StaticCell;
@@ -39,7 +41,8 @@ pub static HEAP: Heap = Heap::empty();
 
 bind_interrupts!(pub struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
-    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>;
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>, embassy_rp::dma::InterruptHandler<DMA_CH1>;
 });
 
 fn init_heap() {
@@ -87,6 +90,32 @@ async fn main(spawner: Spawner) {
 
     let stack_ptr_val = addr_of_mut!(CORE1_STACK) as usize;
 
+    let Pio {
+        mut common, sm0, ..
+    } = Pio::new(p.PIO0, Irqs);
+
+    let bit_clock_pin = p.PIN_10;
+    let left_right_clock_pin = p.PIN_11;
+    let data_pin = p.PIN_9;
+
+    const SAMPLE_RATE: u32 = 48_000;
+    const BIT_DEPTH: u32 = 16;
+
+    let program = PioI2sOutProgram::new(&mut common);
+    let mut i2s = PioI2sOut::new(
+        &mut common,
+        sm0,
+        p.DMA_CH1,
+        Irqs,
+        data_pin,
+        bit_clock_pin,
+        left_right_clock_pin,
+        SAMPLE_RATE,
+        BIT_DEPTH,
+        &program,
+    );
+    i2s.start();
+
     spawn_core1(
         p.CORE1,
         unsafe { &mut *addr_of_mut!(CORE1_STACK) },
@@ -98,5 +127,5 @@ async fn main(spawner: Spawner) {
         },
     );
 
-    core0::main_task(spawner, p.USB, p.PIN_25, midi_control, storage).await;
+    core0::main_task(spawner, p.USB, i2s, p.PIN_25, midi_control, storage).await;
 }
