@@ -12,8 +12,48 @@
 //! hardware max) and sweeps RXDELAY to find the read-data sample point that works at
 //! the higher SCK, verifying each candidate against a golden copy of flash before
 //! trusting it. The read *mode* (EBh quad-IO) is left untouched — only the clock and
-//! sample timing change. Eliminating the 8-bit serial command prefix (continuous-read
-//! mode) is a separate phase 2.
+//! sample timing change.
+//!
+//! Measured phase-1 result (Pimoroni Pico Plus 2 W, clk_sys 150 MHz): bootrom left CS0
+//! at clkdiv=3 (50 MHz), rxdelay=2. Phase 1 moved it to clkdiv=2 (75 MHz) with a
+//! healthy 3-wide rxdelay eye (pass bits rx1..rx3), centered on rxdelay=2. Stable
+//! end-to-end (PSRAM self-test + benchmarks unaffected).
+//!
+//! ---------------------------------------------------------------------------------
+//! PHASE 2 (not implemented — continuous-read mode to drop the command prefix)
+//! ---------------------------------------------------------------------------------
+//! After phase 1 the read format is still: prefix_width=0 (single-lane) prefix_len=_8
+//! addr_width=2 (quad) data_width=2 (quad) dummy_len=4, read cmd 0xEB. The 8-bit
+//! single-lane `0xEB` prefix is re-sent on *every* cache-line fill — 8 SCK cycles of
+//! pure overhead before the quad burst. The bootrom keeps it so flash stays in a
+//! serial-command-compatible state (so erase/program "just work"). See the
+//! `flash_select_xip_read_mode` ROM docs in embassy-rp `rom_data/rp235x.rs`.
+//!
+//! Continuous-read mode ("Performance Enhance" on Winbond W25Q parts) lets subsequent
+//! reads skip the opcode: the QSPI device latches "stay in quad read" from the EBh
+//! mode/"M" bits, so only address+dummy+data are sent. Rough saving on an uncached
+//! 4-byte read: 8 (prefix) + 6 (addr) + 4 (dummy) + 8 (data) ≈ 26 SCK -> ~18 SCK,
+//! ~30% fewer cycles per cache-line fill (less on cache-friendly code; the XIP cache
+//! already hides repeats). Combined with the 50->75 MHz from phase 1 it's ~2x on cold
+//! flash reads, and — because flash (CS0) and PSRAM (CS1) share the QMI bus — frees
+//! bus cycles for the core1 PSRAM delay-line traffic.
+//!
+//! Sketch (all of it RAM-resident + interrupts-masked + golden-validated, exactly like
+//! the phase-1 sweep, since we are again retiming the bus we execute from):
+//!   1. Put the flash into continuous read mode: drive the EBh access with the mode
+//!      bits = 0xA0 (M5:4=10) so the device stays in quad continuous read. On RP2350
+//!      this is the QMI Mx_RFMT/Mx_RCMD "suffix"/mode-bit fields rather than a separate
+//!      flash command; configure CS0 the way the embassy `psram` driver configures CS1
+//!      quad mode (see `qmi.mem(1).rfmt()/.rcmd()` in embassy-rp `psram.rs`).
+//!   2. Set Mx_RFMT.prefix_len = NONE (drop the 8-bit opcode) and keep prefix_width as
+//!      appropriate; set the mode/suffix bits so the device sees the continuation code.
+//!   3. Re-run the same golden-compare validation as phase 1 before trusting it, and
+//!      keep the same restore-on-failure fallback.
+//! CAUTION: with the command prefix gone, flash is no longer in a plain serial-command
+//! state, so the `Storage` flash driver's erase/program path (embassy_rp::flash) must
+//! still round-trip it back to serial mode for writes (the ROM connect/exit-xip +
+//! flush + restore-XIP dance). Validate read AND a storage write/erase cycle before
+//! shipping phase 2.
 
 use defmt::info;
 use embassy_rp::clocks;
