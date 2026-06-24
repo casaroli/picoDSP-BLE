@@ -106,6 +106,11 @@ SECTIONS {
         *(.text.*cyw43*)
         *(.text.*infinitedsp_core*)
         *(.text.*libm*)
+        /* rodata jump tables for the same hot paths (read over XIP during
+         * match-arm dispatch); pulled to RAM to remove the last QMI data reads. */
+        *(.rodata..Lswitch.table.*cyw43*)
+        *(.rodata..Lswitch.table.*infinitedsp_core*)
+        *(.rodata..Lswitch.table.*libm*)
         . = ALIGN(4);
         __sram_code_end = .;
     } > RAM AT > FLASH
