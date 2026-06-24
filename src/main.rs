@@ -8,6 +8,7 @@ mod common;
 mod control;
 mod data;
 mod dsp;
+mod flash_diag;
 mod psram;
 mod tasks;
 mod usb;
@@ -90,6 +91,13 @@ async fn main(spawner: Spawner) {
     // Relocate cyw43 code into SRAM before anything touches the radio.
     init_ram_code();
     let p = embassy_rp::init(Default::default());
+
+    // Log the bootrom flash XIP config, raise CS0 to clk_sys/2 with an RXDELAY sweep,
+    // then log again to confirm the new divisor. Runs single-core before core1/PSRAM/
+    // DMA/USB start, so the sweep is the only flash user while it retimes CS0.
+    flash_diag::log_flash_xip_config();
+    flash_diag::speed_up_flash_xip();
+    flash_diag::log_flash_xip_config();
 
     // Bring up external PSRAM (APS6404L, 8 MiB on QMI CS1 / GPIO47) before core1
     // is spawned, then validate it. The init pauses core1 internally (a no-op
