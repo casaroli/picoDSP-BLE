@@ -11,7 +11,7 @@ embassy-embedded-hal = { version = "0.6.0", features = ["defmt"] }
 embassy-sync = { version = "0.8.0", features = ["defmt"] }
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
-embassy-rp = { version = "0.10.0", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp235xa", "binary-info"] }
+embassy-rp = { version = "0.10.0", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp235xb", "binary-info"] }
 embassy-usb = { version = "0.6.0", features = ["defmt", "max-interface-count-8"] }
 embassy-futures = { version = "0.1.2" }
 embassy-usb-logger = { version = "0.6.0" }
@@ -27,20 +27,12 @@ serde-json-core = "0.5.1"
 # for assign resources example
 assign-resources = { git = "https://github.com/adamgreig/assign-resources", rev = "bd22cb7a92031fb16f74a5da42469d466c33383e" }
 
-# for TB6612FNG example
-tb6612fng = "1.0.0"
-
 #cortex-m = { version = "0.7.6", features = ["critical-section-single-core"] }
 cortex-m = { version = "0.7.6", features = ["inline-asm"] }
 cortex-m-rt = "0.7.0"
 critical-section = "1.1"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
-display-interface-spi = "0.5.0"
-embedded-graphics = "0.8.1"
-mipidsi = "0.8.0"
-display-interface = "0.5.0"
 byte-slice-cast = { version = "1.2.0", default-features = false }
-smart-leds = "0.3.0"
 heapless = "0.9"
 usbd-hid = "0.10.0"
 embedded-alloc = "0.7.0"
@@ -70,3 +62,10 @@ debug = true
 build = [
   { target = "thumbv8m.main-none-eabihf", artifact-dir = "out/examples/rp235x" }
 ]
+
+[[bin]]
+name = "rp2350-synth"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
