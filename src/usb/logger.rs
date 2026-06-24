@@ -1,7 +1,6 @@
 use crate::HEAP;
 use crate::usb::device::UsbSender;
 use embassy_futures::select::{Either, select};
-use embassy_rp::gpio::Output;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
@@ -19,6 +18,8 @@ pub struct LogData {
     pub sample: f32,
     pub duration_us: u64,
     pub load_percent: f32,
+    pub underruns: u32,
+    pub queue_min: u32,
 }
 
 pub static LOG_CHANNEL: Channel<CriticalSectionRawMutex, LogData, 4> = Channel::new();
@@ -210,10 +211,11 @@ pub async fn logger_task(
 
                     log!(
                         &mut sender,
-                        "S: {:>7.4} | Time: {:>4}us | Load: {:>4.1}% | C0: {:>5}B\r\n",
-                        log_data.sample,
+                        "Peak: {:>4}us | Load: {:>5.1}% | QMin: {} | Underruns: {} | C0: {:>5}B\r\n",
                         log_data.duration_us,
                         log_data.load_percent,
+                        log_data.queue_min,
+                        log_data.underruns,
                         c0_stack
                     );
                 }
@@ -228,14 +230,3 @@ pub async fn logger_task(
     }
 }
 
-#[embassy_executor::task]
-pub async fn led_task(mut led: Output<'static>) {
-    loop {
-        let state = LED_SIGNAL_CHANNEL.receive().await;
-        if state {
-            led.set_high();
-        } else {
-            led.set_low();
-        }
-    }
-}

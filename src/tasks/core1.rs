@@ -1,5 +1,6 @@
 use crate::data::presets::Preset;
 use alloc::boxed::Box;
+use core::sync::atomic::Ordering;
 use alloc::sync::Arc;
 use embassy_time::Instant;
 use infinitedsp_core::FrameProcessor;
@@ -15,8 +16,8 @@ use infinitedsp_core::effects::utility::stereo_widener::StereoWidener;
 
 use crate::HEAP;
 use crate::common::shared::{
-    AUDIO_CHANNEL, AudioData, BLOCK_SIZE, CORE1_STACK_SIZE, PRESET_CHANNEL, SAMPLE_RATE,
-    disable_denormals,
+    AUDIO_CHANNEL, AUDIO_QUEUE_MIN, AUDIO_UNDERRUNS, AudioData, BLOCK_SIZE, CORE1_STACK_SIZE,
+    PRESET_CHANNEL, SAMPLE_RATE, disable_denormals,
 };
 use crate::control::midi::MidiControl;
 use crate::dsp::moog::new_moog_voice;
@@ -43,19 +44,23 @@ fn build_synth(
     let time_l = d.time;
     let time_r = d.time * 1.15;
 
-    let delay_l = Delay::new(
+    // Delay::new hardcodes 44100 Hz; pre-size to actual rate now while the heap
+    // is still unfragmented, avoiding a failed realloc inside DspChain::and().
+    let mut delay_l = Delay::new(
         0.3,
         AudioParam::Static(time_l),
         AudioParam::Static(d.feedback),
         AudioParam::Static(d.mix),
     );
+    delay_l.set_sample_rate(SAMPLE_RATE);
 
-    let delay_r = Delay::new(
+    let mut delay_r = Delay::new(
         0.3,
         AudioParam::Static(time_r),
         AudioParam::Static(d.feedback),
         AudioParam::Static(d.mix),
     );
+    delay_r.set_sample_rate(SAMPLE_RATE);
 
     let delay_node = ParallelMixer::new(1.0, DualMono::new(delay_l, delay_r));
     let delay_bypass = Bypass::new(delay_node, d.enabled != 0);
@@ -109,10 +114,12 @@ pub async fn core1_task(midi_control: Arc<MidiControl>, initial_preset: Preset, 
 
     log_status!("Core 1: Starting...\r\n");
     midi_control.set_portamento(initial_preset.portamento);
-    log_status!("Core 1: Measuring memory pressure.\r\n");
+    log_status!("Core 1: Heap free before build: {} KB\r\n", HEAP.free() / 1024);
 
     let mut synth: Option<Box<dyn FrameProcessor<Stereo> + Send>> =
         Some(Box::new(build_synth(midi_control.clone(), initial_preset)));
+
+    log_status!("Core 1: build_synth OK\r\n");
 
     print_stats(stack_ptr).await;
     log_status!("Core 1: DSP Running (STEREO) with Preset\r\n");
@@ -121,6 +128,11 @@ pub async fn core1_task(midi_control: Arc<MidiControl>, initial_preset: Preset, 
     let mut frame_index: u64 = 0;
 
     let max_duration_us = (BLOCK_SIZE as f32 / 2.0 / SAMPLE_RATE * 1_000_000.0) as u64;
+
+    // Track the *peak* per-buffer duration over each ~1s reporting window. Audio glitches
+    // come from individual buffers overrunning the deadline, which a once-per-second
+    // instantaneous sample almost always misses; the peak is the number that matters.
+    let mut peak_duration_us: u64 = 0;
 
     loop {
         if let Ok(new_preset) = PRESET_CHANNEL.try_receive() {
@@ -145,15 +157,25 @@ pub async fn core1_task(midi_control: Arc<MidiControl>, initial_preset: Preset, 
 
         let end_time = Instant::now();
 
+        let duration = (end_time - start_time).as_micros();
+        if duration > peak_duration_us {
+            peak_duration_us = duration;
+        }
+
         if frame_index % (SAMPLE_RATE as u64) < (BLOCK_SIZE as u64 / 2) {
-            let duration = (end_time - start_time).as_micros();
-            let load = (duration as f32 / max_duration_us as f32) * 100.0;
+            let load = (peak_duration_us as f32 / max_duration_us as f32) * 100.0;
+
+            let underruns = AUDIO_UNDERRUNS.swap(0, Ordering::Relaxed);
+            let queue_min = AUDIO_QUEUE_MIN.swap(u32::MAX, Ordering::Relaxed);
 
             let _ = LOG_CHANNEL.try_send(LogData {
                 sample: buffer[0],
-                duration_us: duration,
+                duration_us: peak_duration_us,
                 load_percent: load,
+                underruns,
+                queue_min: if queue_min == u32::MAX { 0 } else { queue_min },
             });
+            peak_duration_us = 0;
         }
 
         AUDIO_CHANNEL.send(AudioData { buffer }).await;

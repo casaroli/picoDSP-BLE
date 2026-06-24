@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod bt;
 mod common;
 mod control;
 mod data;
@@ -13,10 +14,8 @@ mod usb;
 use alloc::sync::Arc;
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
-use defmt::*;
 use embassy_rp::pio::Pio;
 use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
-use embassy_time::Timer;
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -26,7 +25,7 @@ use panic_halt as _;
 use embassy_rp::bind_interrupts;
 use embassy_rp::flash::Flash;
 use embassy_rp::multicore::{Stack, spawn_core1};
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, USB};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, PIO0, PIO1, USB};
 use embassy_rp::usb::InterruptHandler;
 
 use static_cell::StaticCell;
@@ -42,7 +41,8 @@ pub static HEAP: Heap = Heap::empty();
 bind_interrupts!(pub struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
-    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>, embassy_rp::dma::InterruptHandler<DMA_CH1>;
+    PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>, embassy_rp::dma::InterruptHandler<DMA_CH1>, embassy_rp::dma::InterruptHandler<DMA_CH2>;
 });
 
 fn init_heap() {
@@ -127,5 +127,12 @@ async fn main(spawner: Spawner) {
         },
     );
 
-    core0::main_task(spawner, p.USB, i2s, p.PIN_25, midi_control, storage).await;
+    // Bluetooth host (BLE-MIDI keyboard) on core0. CYW43 owns PIN_23/24/25/29 + PIO1 + DMA_CH2;
+    // the onboard LED moves to CYW43 GPIO 0 (driven inside this task), so PIN_25 — the radio's
+    // chip-select on the Pico Plus 2 W — is no longer used as a plain GPIO.
+    spawner.spawn(
+        bt::bluetooth_task(p.PIN_23, p.PIN_25, p.PIN_24, p.PIN_29, p.PIO1, p.DMA_CH2).unwrap(),
+    );
+
+    core0::main_task(spawner, p.USB, i2s, midi_control, storage).await;
 }

@@ -1,10 +1,10 @@
-use crate::common::shared::{SystemCommand, COMMAND_CHANNEL, PRESET_CHANNEL};
+use crate::common::shared::{BLE_MIDI_CHANNEL, SystemCommand, COMMAND_CHANNEL, PRESET_CHANNEL};
 use crate::data::storage::{Storage, MAGIC as STORAGE_MAGIC, VERSION as STORAGE_VERSION};
 use crate::usb::logger::{LED_SIGNAL_CHANNEL, MIDI_LOG_CHANNEL};
 use alloc::sync::Arc;
 use alloc::vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select3, Either3};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_time::Instant;
@@ -353,6 +353,117 @@ impl FrameProcessor<Mono> for MidiFilterResonance {
     }
 }
 
+/// Handle a single channel-voice MIDI message. Shared by the USB-MIDI path and the
+/// BLE-MIDI path so both transports drive the synth through identical logic.
+async fn handle_voice_message(
+    status: u8,
+    d1: u8,
+    d2: u8,
+    notes: &mut NoteStack,
+    midi_control: &MidiControl,
+    storage: &mut Storage<'static>,
+    current_preset_index: &mut usize,
+) {
+    log_midi!("MIDI: [{:02X}-{:02X}-{:02X}] - ", status, d1, d2);
+
+    let cmd = status & 0xF0;
+
+    match cmd {
+        NOTE_ON if d2 > 0 => {
+            let freq = midi_to_freq(d1);
+            log_midi!("NOTE ON: {} ({} Hz)", d1, freq);
+            notes.note_on(d1);
+            midi_control.set_freq(freq);
+            midi_control.set_gate(true);
+            let _ = LED_SIGNAL_CHANNEL.try_send(true);
+        }
+        NOTE_OFF | NOTE_ON => {
+            let freq = midi_to_freq(d1);
+            log_midi!("NOTE OFF: {}", freq);
+            notes.note_off(d1);
+
+            if let Some(last_note) = notes.active_note() {
+                midi_control.set_freq(midi_to_freq(last_note));
+                midi_control.set_gate(true);
+            } else {
+                midi_control.set_gate(false);
+                let _ = LED_SIGNAL_CHANNEL.try_send(false);
+            }
+        }
+        CONTROL_CHANGE => {
+            let val_norm = d2 as f32 / 127.0;
+            match d1 {
+                CC_MOD_WHEEL => {
+                    log_midi!("MOD WHEEL: {:.2}", val_norm);
+                    midi_control.set_mod_wheel(val_norm);
+                }
+                CC_PORTAMENTO_TIME => {
+                    let amount = val_norm;
+                    log_midi!("PORTAMENTO: {:.2}", amount);
+                    midi_control.set_portamento(amount);
+                }
+                CC_SUSTAIN => {
+                    let sustain_on = d2 >= 64;
+                    log_midi!("SUSTAIN: {}", if sustain_on { "ON" } else { "OFF" });
+                    notes.set_sustain(sustain_on);
+
+                    if !sustain_on {
+                        if let Some(last_note) = notes.active_note() {
+                            midi_control.set_freq(midi_to_freq(last_note));
+                            midi_control.set_gate(true);
+                        } else {
+                            midi_control.set_gate(false);
+                            let _ = LED_SIGNAL_CHANNEL.try_send(false);
+                        }
+                    }
+                }
+                CC_FILTER_RESONANCE => {
+                    log_midi!("RESONANCE: {:.2}", val_norm);
+                    defmt::info!("PARAM resonance <- {=f32}", val_norm);
+                    midi_control.set_parameter_2(val_norm);
+                }
+                CC_FILTER_CUTOFF => {
+                    log_midi!("CUTOFF: {:.2}", val_norm);
+                    defmt::info!("PARAM cutoff <- {=f32}", val_norm);
+                    midi_control.set_parameter_1(val_norm);
+                }
+                CC_ALL_SOUND_OFF | CC_ALL_NOTES_OFF => {
+                    log_midi!("ALL NOTES/SOUND OFF");
+                    notes.clear();
+                    midi_control.reset();
+                    let _ = LED_SIGNAL_CHANNEL.try_send(false);
+                }
+                _ => {}
+            }
+        }
+        PROGRAM_CHANGE => {
+            log_midi!("PROGRAM CHANGE: {}\r\n", d1);
+            defmt::info!("PROGRAM CHANGE -> preset {=u8}", d1);
+            *current_preset_index = d1 as usize;
+            if let Some(preset) = storage.load_preset(d1 as usize).await {
+                log_midi!("Loaded: {}\r\n", preset.get_name());
+                let cutoff_norm =
+                    libm::log10f(preset.filter.cutoff / 20.0) / libm::log10f(1000.0);
+                midi_control.set_parameter_1(cutoff_norm.clamp(0.0, 1.0));
+                let res_norm = (preset.filter.resonance - 0.707) / 9.3;
+                midi_control.set_parameter_2(res_norm.clamp(0.0, 1.0));
+                midi_control.set_portamento(preset.portamento);
+                let _ = PRESET_CHANNEL.try_send(preset);
+            } else {
+                log_midi!("Preset {} not found\r\n", d1);
+            }
+        }
+        PITCH_BEND => {
+            let val = ((d2 as u16) << 7) | (d1 as u16);
+            log_midi!("PITCHBEND: {}", val);
+            let norm = (val as f32 - 8192.0) / 8192.0;
+            let factor = libm::powf(2.0, (norm * 2.0) / 12.0);
+            midi_control.set_pitch_bend(factor);
+        }
+        _ => {}
+    }
+}
+
 #[embassy_executor::task]
 pub async fn midi_task(
     mut receiver: Receiver<'static, Driver<'static, USB>>,
@@ -370,11 +481,46 @@ pub async fn midi_task(
     let mut in_sysex = false;
 
     loop {
-        receiver.wait_connection().await;
+        // Service BLE-MIDI and commands even while USB is disconnected, so a BLE keyboard
+        // can play the synth without a USB host attached.
+        match select3(
+            receiver.wait_connection(),
+            COMMAND_CHANNEL.receive(),
+            BLE_MIDI_CHANNEL.receive(),
+        )
+        .await
+        {
+            Either3::First(_) => {}
+            Either3::Second(SystemCommand::ResetStorage) => {
+                log_midi!("Command: Reset Storage...\r\n");
+                storage.format().await;
+                log_midi!("Storage Reset Complete.\r\n");
+                continue;
+            }
+            Either3::Third(msg) => {
+                handle_voice_message(
+                    msg[0],
+                    msg[1],
+                    msg[2],
+                    &mut notes,
+                    midi_control.as_ref(),
+                    &mut storage,
+                    &mut current_preset_index,
+                )
+                .await;
+                continue;
+            }
+        }
 
         loop {
-            match select(receiver.read_packet(&mut buf), COMMAND_CHANNEL.receive()).await {
-                Either::First(read_result) => match read_result {
+            match select3(
+                receiver.read_packet(&mut buf),
+                COMMAND_CHANNEL.receive(),
+                BLE_MIDI_CHANNEL.receive(),
+            )
+            .await
+            {
+                Either3::First(read_result) => match read_result {
                     Ok(n) => {
                         let data = &buf[..n];
                         for packet in data.chunks(4) {
@@ -509,6 +655,10 @@ pub async fn midi_task(
                                                             "SysEx: Write Request ({} bytes)\r\n",
                                                             msg.len()
                                                         );
+                                                        defmt::info!(
+                                                            "SysEx WRITE_REQ from Edit: {=usize} bytes",
+                                                            msg.len()
+                                                        );
                                                         let encoded_data = &msg[4..msg.len() - 1];
                                                         if encoded_data.len() == 8192 {
                                                             let mut decoded_data = vec![0u8; 4096];
@@ -540,6 +690,10 @@ pub async fn midi_task(
                                                                     .await;
                                                                 log_midi!(
                                                                     "SysEx: Write Success\r\n"
+                                                                );
+                                                                defmt::info!(
+                                                                    "SysEx write OK -> flash; reloading active preset {=usize}",
+                                                                    current_preset_index
                                                                 );
 
                                                                 let _ = sender
@@ -589,6 +743,13 @@ pub async fn midi_task(
                                                                 }
                                                             } else {
                                                                 log_midi!("SysEx: Invalid Magic/Version ({:X}, {})\r\n", magic, version);
+                                                                defmt::warn!(
+                                                                    "SysEx REJECTED bad magic/version: magic={=u32:#x} version={=u32} (expected {=u32:#x}/{=u32})",
+                                                                    magic,
+                                                                    version,
+                                                                    STORAGE_MAGIC,
+                                                                    STORAGE_VERSION
+                                                                );
                                                                 let _ = sender
                                                                     .write_packet(&[
                                                                         0x04,
@@ -609,6 +770,10 @@ pub async fn midi_task(
                                                         } else {
                                                             log_midi!(
                                                                 "SysEx: Invalid Length ({})\r\n",
+                                                                encoded_data.len()
+                                                            );
+                                                            defmt::warn!(
+                                                                "SysEx REJECTED bad length: encoded {=usize} bytes (expected 8192)",
                                                                 encoded_data.len()
                                                             );
                                                             let _ = sender
@@ -638,123 +803,41 @@ pub async fn midi_task(
                                 continue;
                             }
 
-                            log_midi!(
-                                "MIDI: [{:02X}-{:02X}-{:02X}-{:02X}] - ",
-                                cin,
+                            handle_voice_message(
                                 status,
                                 d1,
-                                d2
-                            );
-
-                            let cmd = status & 0xF0;
-
-                            match cmd {
-                                NOTE_ON if d2 > 0 => {
-                                    let freq = midi_to_freq(d1);
-                                    log_midi!("NOTE ON: {} ({} Hz)", d1, freq);
-                                    notes.note_on(d1);
-                                    midi_control.set_freq(freq);
-                                    midi_control.set_gate(true);
-                                    let _ = LED_SIGNAL_CHANNEL.try_send(true);
-                                }
-                                NOTE_OFF | NOTE_ON => {
-                                    let freq = midi_to_freq(d1);
-                                    log_midi!("NOTE OFF: {}", freq);
-                                    notes.note_off(d1);
-
-                                    if let Some(last_note) = notes.active_note() {
-                                        midi_control.set_freq(midi_to_freq(last_note));
-                                        midi_control.set_gate(true);
-                                    } else {
-                                        midi_control.set_gate(false);
-                                        let _ = LED_SIGNAL_CHANNEL.try_send(false);
-                                    }
-                                }
-                                CONTROL_CHANGE => {
-                                    let val_norm = d2 as f32 / 127.0;
-                                    match d1 {
-                                        CC_MOD_WHEEL => {
-                                            log_midi!("MOD WHEEL: {:.2}", val_norm);
-                                            midi_control.set_mod_wheel(val_norm);
-                                        }
-                                        CC_PORTAMENTO_TIME => {
-                                            let amount = val_norm;
-                                            log_midi!("PORTAMENTO: {:.2}", amount);
-                                            midi_control.set_portamento(amount);
-                                        }
-                                        CC_SUSTAIN => {
-                                            let sustain_on = d2 >= 64;
-                                            log_midi!(
-                                                "SUSTAIN: {}",
-                                                if sustain_on { "ON" } else { "OFF" }
-                                            );
-                                            notes.set_sustain(sustain_on);
-
-                                            if !sustain_on {
-                                                if let Some(last_note) = notes.active_note() {
-                                                    midi_control.set_freq(midi_to_freq(last_note));
-                                                    midi_control.set_gate(true);
-                                                } else {
-                                                    midi_control.set_gate(false);
-                                                    let _ = LED_SIGNAL_CHANNEL.try_send(false);
-                                                }
-                                            }
-                                        }
-                                        CC_FILTER_RESONANCE => {
-                                            log_midi!("RESONANCE: {:.2}", val_norm);
-                                            midi_control.set_parameter_2(val_norm);
-                                        }
-                                        CC_FILTER_CUTOFF => {
-                                            log_midi!("CUTOFF: {:.2}", val_norm);
-                                            midi_control.set_parameter_1(val_norm);
-                                        }
-                                        CC_ALL_SOUND_OFF | CC_ALL_NOTES_OFF => {
-                                            log_midi!("ALL NOTES/SOUND OFF");
-                                            notes.clear();
-                                            midi_control.reset();
-                                            let _ = LED_SIGNAL_CHANNEL.try_send(false);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                PROGRAM_CHANGE => {
-                                    log_midi!("PROGRAM CHANGE: {}\r\n", d1);
-                                    current_preset_index = d1 as usize;
-                                    if let Some(preset) = storage.load_preset(d1 as usize).await {
-                                        log_midi!("Loaded: {}\r\n", preset.get_name());
-                                        let cutoff_norm = libm::log10f(preset.filter.cutoff / 20.0)
-                                            / libm::log10f(1000.0);
-                                        midi_control.set_parameter_1(cutoff_norm.clamp(0.0, 1.0));
-                                        let res_norm = (preset.filter.resonance - 0.707) / 9.3;
-                                        midi_control.set_parameter_2(res_norm.clamp(0.0, 1.0));
-                                        midi_control.set_portamento(preset.portamento);
-                                        let _ = PRESET_CHANNEL.try_send(preset);
-                                    } else {
-                                        log_midi!("Preset {} not found\r\n", d1);
-                                    }
-                                }
-                                PITCH_BEND => {
-                                    let val = ((d2 as u16) << 7) | (d1 as u16);
-                                    log_midi!("PITCHBEND: {}", val);
-                                    let norm = (val as f32 - 8192.0) / 8192.0;
-                                    let factor = libm::powf(2.0, (norm * 2.0) / 12.0);
-                                    midi_control.set_pitch_bend(factor);
-                                }
-                                _ => {}
-                            }
+                                d2,
+                                &mut notes,
+                                midi_control.as_ref(),
+                                &mut storage,
+                                &mut current_preset_index,
+                            )
+                            .await;
                         }
                     }
                     Err(_) => {
                         break;
                     }
                 },
-                Either::Second(cmd) => match cmd {
+                Either3::Second(cmd) => match cmd {
                     SystemCommand::ResetStorage => {
                         log_midi!("Command: Reset Storage...\r\n");
                         storage.format().await;
                         log_midi!("Storage Reset Complete.\r\n");
                     }
                 },
+                Either3::Third(msg) => {
+                    handle_voice_message(
+                        msg[0],
+                        msg[1],
+                        msg[2],
+                        &mut notes,
+                        midi_control.as_ref(),
+                        &mut storage,
+                        &mut current_preset_index,
+                    )
+                    .await;
+                }
             }
         }
     }
