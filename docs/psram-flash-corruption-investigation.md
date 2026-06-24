@@ -142,29 +142,100 @@ Avenues not yet tried:
 - **Address distribution:** log the exact corrupt addresses across many runs — are they
   uniformly random, or biased to rows/pages/banks? That points at the mechanism.
 
-## 7. How to reproduce / re-add the test harness
+## 7. The corruption test (paste-ready) and how to reproduce
 
-The diagnostic block lived in `main.rs` right after `storage.init().await`. Sketch:
+This is the exact, runnable harness used to reach the §3b / §4 conclusions. Drop it
+into `main.rs` **right after `storage.init().await`** (so `psram_region` and `storage`
+are in scope, and PSRAM is up). It is **non-destructive** to your stored presets — it
+rewrites the storage sector with its own contents purely to trigger the flash
+erase+write path.
+
+Important caveats baked into the design:
+- Write **more than the 16 KiB XIP cache** (here 64 KiB) and only verify the first
+  32 KiB, so the checked words were genuinely **evicted to PSRAM** before the flash op
+  (not still sitting clean in the write-back cache, which would hide the corruption).
+- For a *clean* read of what's actually in PSRAM, this build leaves
+  `storage.write_raw()` calling `after_flash_write()` → `reinit()` (restores the CS1
+  config, §3a). That's required for the post-flash reads to use a valid config; it does
+  **not** repair the corrupted content. To observe the raw clobbered-config state too,
+  temporarily comment the `after_flash_write()` call in `storage::write_raw` and call
+  `psram::reinit()` yourself after the dumps.
+- Optional uncached CS1 window `0x1500_0000` lets you read straight from PSRAM bypassing
+  the cache (note: single-beat uncached reads are inherently a bit marginal on this
+  board even pre-flash — see §4 #8 — so trust the **cached** counts as the oracle).
 
 ```rust
-// Write > 16 KiB so early words are evicted to real PSRAM (not dirty in write-back cache).
-let base = psram_region.base() as *mut u32;            // cached CS1 = 0x1100_0000
-let ubase = 0x1500_0000usize as *mut u32;              // uncached CS1
-let n = 16384; let check = 8192;
-for i in 0..n { unsafe { core::ptr::write_volatile(base.add(i), 0xC0DE_0000 + i as u32) }; }
-let pre = /* count mismatches reading base[0..check] */;          // expect 0 (cached)
-let mut s = [0u8; 4096];
-storage.read_raw(&mut s).await; storage.write_raw(&s).await;      // non-destructive flash erase+write
-// (write_raw now calls after_flash_write() -> reinit(); for raw diagnosis, bypass it)
-let post = /* count mismatches reading base[0..check] */;          // ~20-24 wrong (corrupt content)
-// Definitive: rewrite fresh + read back -> 0 errors (interface fine, content was lost).
-for i in 0..check { unsafe { core::ptr::write_volatile(base.add(i), 0xBEEF_0000 + i as u32) }; }
-let rw = /* count mismatches */;                                   // 0
+{
+    let base = psram_region.base() as *mut u32; // cached CS1 = 0x1100_0000
+    let ubase = 0x1500_0000usize as *mut u32;   // uncached CS1 (0x1400_0000 nocache + CS1 offset)
+    let n = 16384usize;  // 64 KiB written
+    let check = 8192usize; // verify first 32 KiB (past the 16 KiB cache => really in PSRAM)
+
+    let pat = |i: usize| 0xC0DE_0000u32.wrapping_add(i as u32);
+    for i in 0..n {
+        unsafe { core::ptr::write_volatile(base.add(i), pat(i)) };
+    }
+    let count = |p: *mut u32| -> usize {
+        let mut m = 0;
+        for i in 0..check {
+            if unsafe { core::ptr::read_volatile(p.add(i)) } != pat(i) {
+                m += 1;
+            }
+        }
+        m
+    };
+
+    // (1) before any flash op: cached reads should be perfect (uncached ~30, marginal).
+    let pre = count(base);
+    let pre_u = count(ubase);
+
+    // (2) non-destructive flash erase+write (rewrite the storage sector with itself).
+    let mut sector = [0u8; 4096];
+    storage.read_raw(&mut sector).await;
+    storage.write_raw(&sector).await; // calls after_flash_write() -> reinit() (restores config)
+    let post = count(base);   // expect ~20-24 mismatches: CORRUPTED CONTENT
+    let post_u = count(ubase);
+    defmt::info!(
+        "PSRAM verify: pre cached {}/{} uncached {}/{} | post cached {}/{} uncached {}/{}",
+        pre, check, pre_u, check, post, check, post_u, check
+    );
+
+    // (3) DECISIVE: write a fresh pattern post-flash and read it back.
+    // 0 mismatches here proves reads/writes are fine and the §2 errors were lost content.
+    for i in 0..check {
+        unsafe { core::ptr::write_volatile(base.add(i), 0xBEEF_0000u32.wrapping_add(i as u32)) };
+    }
+    cortex_m::asm::dsb();
+    let mut rw = 0usize;
+    for i in 0..check {
+        if unsafe { core::ptr::read_volatile(base.add(i)) } != 0xBEEF_0000u32.wrapping_add(i as u32) {
+            rw += 1;
+        }
+    }
+    defmt::info!("PSRAM post-flash REWRITE+read: {}/{} mismatch", rw, check); // expect 0
+}
 ```
+
+Expected output (the result this whole doc rests on):
+
+```
+PSRAM verify: pre cached 0/8192 uncached 24/8192 | post cached 20/8192 uncached 20/8192
+PSRAM post-flash REWRITE+read: 0/8192 mismatch
+```
+
+i.e. **pre-flash cached reads perfect → post-flash ~20 corrupt → rewriting the same
+addresses is perfect again.** The flash op lost the content of a few cells; the PSRAM
+interface is fine.
+
+Variations used during the investigation (§4): sweep `rxdelay` 0..7 or `clkdiv` 2..10 via
+`embassy_rp::pac::QMI.mem(1).timing().modify(|w| { w.set_rxdelay(d); w.set_clkdiv(d); })`
+(with a `cortex_m::asm::dsb()` after) and re-`count()` between settings — both were flat,
+confirming it is not a read-timing problem.
 
 Useful registers: `embassy_rp::pac::QMI.mem(1).{timing,rfmt,rcmd,wfmt,wcmd}()`,
 `embassy_rp::pac::XIP_CTRL.ctrl().writable_m1()`, `embassy_rp::pac::PADS_QSPI.gpio(n)`
-(n: 0=SCLK, 1–4=SD0–3, 5=SS).
+(n: 0=SCLK, 1–4=SD0–3, 5=SS). A `dump_m1(tag)` helper that logged all five M1 registers +
+`writable_m1` produced the §3a table; re-add it if you need to compare config states.
 
 ## 8. Key code locations
 
