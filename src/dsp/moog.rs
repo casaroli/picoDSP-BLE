@@ -14,43 +14,43 @@ use infinitedsp_core::synthesis::lfo::Lfo;
 use infinitedsp_core::synthesis::oscillator::{Oscillator, Waveform};
 
 use crate::control::midi::{
-    MidiControl, MidiFilterCutoff, MidiFilterResonance, MidiFreq, MidiGate, MidiVelocity,
+    slot, AtomicParam, MidiControl, MidiFilterCutoff, MidiFilterResonance, MidiFreq, MidiGate,
+    MidiVelocity,
 };
 use crate::data::presets::{OscSettings, Preset};
+
+/// An `AudioParam` whose value is read live from a `MidiControl` continuous slot, so the
+/// editor can sweep it via CC without rebuilding the voice. See `control::cc_map`.
+fn live(midi: &Arc<MidiControl>, slot: usize) -> AudioParam {
+    AudioParam::Dynamic(Box::new(AtomicParam::new(midi.clone(), slot)))
+}
 
 struct MoogOscillatorSection {
     osc1: Oscillator,
     osc2: Oscillator,
     osc3: Oscillator,
     noise: Oscillator,
-    level1: f32,
-    level2: f32,
-    level3: f32,
-    level_noise: f32,
+    /// Oscillator + noise levels are read live each block (slots OSC1/2/3_LEVEL, NOISE) so the
+    /// editor can sweep them via CC. An osc whose level is ~0 is skipped to save CPU, but the
+    /// node always exists, so raising the level later brings it back in.
+    control: Arc<MidiControl>,
     scratch_buffer: Vec<f32>,
 }
 
 impl MoogOscillatorSection {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         osc1: Oscillator,
         osc2: Oscillator,
         osc3: Oscillator,
         noise: Oscillator,
-        l1: f32,
-        l2: f32,
-        l3: f32,
-        ln: f32,
+        control: Arc<MidiControl>,
     ) -> Self {
         Self {
             osc1,
             osc2,
             osc3,
             noise,
-            level1: l1,
-            level2: l2,
-            level3: l3,
-            level_noise: ln,
+            control,
             scratch_buffer: vec![0.0; 256],
         }
     }
@@ -63,36 +63,41 @@ impl FrameProcessor<Mono> for MoogOscillatorSection {
             self.scratch_buffer.resize(len, 0.0);
         }
 
-        if self.level1 > 0.0001 {
+        let level1 = self.control.get_cont(slot::OSC1_LEVEL);
+        let level2 = self.control.get_cont(slot::OSC2_LEVEL);
+        let level3 = self.control.get_cont(slot::OSC3_LEVEL);
+        let level_noise = self.control.get_cont(slot::NOISE);
+
+        if level1 > 0.0001 {
             self.osc1.process(buffer, frame_index);
             for s in buffer.iter_mut() {
-                *s *= self.level1;
+                *s *= level1;
             }
         } else {
             buffer.fill(0.0);
         }
 
-        if self.level2 > 0.0001 {
+        if level2 > 0.0001 {
             self.osc2
                 .process(&mut self.scratch_buffer[0..len], frame_index);
             for (s, scratch) in buffer.iter_mut().zip(self.scratch_buffer.iter()) {
-                *s += *scratch * self.level2;
+                *s += *scratch * level2;
             }
         }
 
-        if self.level3 > 0.0001 {
+        if level3 > 0.0001 {
             self.osc3
                 .process(&mut self.scratch_buffer[0..len], frame_index);
             for (s, scratch) in buffer.iter_mut().zip(self.scratch_buffer.iter()) {
-                *s += *scratch * self.level3;
+                *s += *scratch * level3;
             }
         }
 
-        if self.level_noise > 0.0001 {
+        if level_noise > 0.0001 {
             self.noise
                 .process(&mut self.scratch_buffer[0..len], frame_index);
             for (s, scratch) in buffer.iter_mut().zip(self.scratch_buffer.iter()) {
-                *s += *scratch * self.level_noise;
+                *s += *scratch * level_noise;
             }
         }
     }
@@ -127,121 +132,84 @@ pub fn new_moog_voice(
     midi: Arc<MidiControl>,
     preset: Preset,
 ) -> impl FrameProcessor<Mono> + Send {
-    let cutoff_norm = libm::log10f(preset.filter.cutoff / 20.0) / libm::log10f(1000.0);
-    midi.set_parameter_1(cutoff_norm.clamp(0.0, 1.0));
+    // Seed every live continuous slot from the preset (cutoff, resonance, levels, octave,
+    // detune, env amt, ADSRs, FX amounts). The DSP nodes below read these slots per-block, so
+    // a CC sweep updates them live; a structural rebuild re-seeds here from the working preset.
+    midi.seed_from_preset(&preset);
 
-    // Resonance is a direct 0..1 ladder value (filter feedback k = 4*r; self-osc at 1.0).
-    midi.set_parameter_2(preset.filter.resonance.clamp(0.0, 1.0));
+    // Single shared LFO config. Whether the LFO exists at all (lfo_enabled) and its waveform
+    // are structural — toggling/changing them rebuilds the voice. Its rate and the vibrato /
+    // filter depths are live: each LFO instance reads the LFO_FREQ slot for its rate and is
+    // built with range -1..1 then scaled by a live depth Gain (LFO_VIB_AMT / LFO_FILT_AMT), so
+    // a slider sweep updates smoothly. When disabled, no LFO nodes are built (the live slots
+    // simply go unread until it's re-enabled).
+    let lfo_on = preset.lfo_enabled != 0;
+    let lfo_wave = preset.lfo.get_waveform();
 
-    let (vibrato_node, filter_lfo_node) = if preset.lfo_enabled != 0 {
-        let p = &preset.lfo;
-        let mut lfo_vib = Lfo::new(AudioParam::Static(p.frequency), p.get_waveform());
-        lfo_vib.set_range(-p.vibrato_amount, p.vibrato_amount);
-        lfo_vib.set_sample_rate(sample_rate);
-
-        let mut lfo_filt = Lfo::new(AudioParam::Static(p.frequency), p.get_waveform());
-        lfo_filt.set_range(-p.filter_amount, p.filter_amount);
-        lfo_filt.set_sample_rate(sample_rate);
-
-        (Some(lfo_vib), Some(lfo_filt))
-    } else {
-        (None, None)
+    // Build a fresh LFO whose output is scaled live by `depth_slot` (one instance per use site,
+    // since `AudioParam` owns its processor).
+    let make_lfo = |depth_slot: usize| -> AudioParam {
+        let mut l = Lfo::new(live(&midi, slot::LFO_FREQ), lfo_wave);
+        l.set_range(-1.0, 1.0);
+        l.set_sample_rate(sample_rate);
+        AudioParam::Dynamic(Box::new(
+            DspChain::new(l, sample_rate).and(Gain::new(live(&midi, depth_slot))),
+        ))
     };
 
-    let create_pitch = |params: &OscSettings, vib: Option<Lfo>| -> AudioParam {
-        let mut chain = DspChain::new(MidiFreq::new(midi.clone()), sample_rate);
+    let filter_lfo_node: Option<AudioParam> = lfo_on.then(|| make_lfo(slot::LFO_FILT_AMT));
 
-        if params.octave != 0.0 {
-            let mult = libm::powf(2.0, params.octave);
-            chain = chain.and(Gain::new_fixed(mult));
-        }
+    // `idx` (0,1,2) selects the oscillator's live octave/detune slots. Octave (a 2^oct
+    // frequency multiplier) and detune are always inserted so they stay live; vibrato is
+    // structural (its LFO is rebuilt when the per-osc toggle / lfo_enabled changes).
+    let create_pitch = |idx: usize, params: &OscSettings| -> AudioParam {
+        let mut chain = DspChain::new(MidiFreq::new(midi.clone()), sample_rate)
+            .and(Gain::new(live(&midi, slot::osc_octave(idx))))
+            .and(Offset::new_param(live(&midi, slot::osc_detune(idx))));
 
-        if params.detune != 0.0 {
-            chain = chain.and(Offset::new(params.detune));
-        }
-
-        if params.is_vibrato_enabled() {
-            if let Some(v) = vib {
-                chain = chain.and(Offset::new_param(AudioParam::Dynamic(Box::new(v))));
-            }
+        if lfo_on && params.is_vibrato_enabled() {
+            chain = chain.and(Offset::new_param(make_lfo(slot::LFO_VIB_AMT)));
         }
 
         AudioParam::Dynamic(Box::new(chain))
     };
 
-    let osc1_vib = vibrato_node.as_ref().map(|_l| {
-        let p = &preset.lfo;
-        let mut l = Lfo::new(AudioParam::Static(p.frequency), p.get_waveform());
-        l.set_range(-p.vibrato_amount, p.vibrato_amount);
-        l.set_sample_rate(sample_rate);
-        l
-    });
-    let osc2_vib = vibrato_node.as_ref().map(|_l| {
-        let p = &preset.lfo;
-        let mut l = Lfo::new(AudioParam::Static(p.frequency), p.get_waveform());
-        l.set_range(-p.vibrato_amount, p.vibrato_amount);
-        l.set_sample_rate(sample_rate);
-        l
-    });
-    let osc3_vib = vibrato_node.as_ref().map(|_l| {
-        let p = &preset.lfo;
-        let mut l = Lfo::new(AudioParam::Static(p.frequency), p.get_waveform());
-        l.set_range(-p.vibrato_amount, p.vibrato_amount);
-        l.set_sample_rate(sample_rate);
-        l
-    });
-
-    let mut osc1_node = Oscillator::new(
-        create_pitch(&preset.osc1, osc1_vib),
-        preset.osc1.get_waveform(),
-    );
+    let mut osc1_node =
+        Oscillator::new(create_pitch(0, &preset.osc1), preset.osc1.get_waveform());
     osc1_node.set_sample_rate(sample_rate);
 
-    let mut osc2_node = Oscillator::new(
-        create_pitch(&preset.osc2, osc2_vib),
-        preset.osc2.get_waveform(),
-    );
+    let mut osc2_node =
+        Oscillator::new(create_pitch(1, &preset.osc2), preset.osc2.get_waveform());
     osc2_node.set_sample_rate(sample_rate);
 
-    let mut osc3_node = Oscillator::new(
-        create_pitch(&preset.osc3, osc3_vib),
-        preset.osc3.get_waveform(),
-    );
+    let mut osc3_node =
+        Oscillator::new(create_pitch(2, &preset.osc3), preset.osc3.get_waveform());
     osc3_node.set_sample_rate(sample_rate);
 
     let mut noise_node = Oscillator::new(AudioParam::Static(0.0), Waveform::WhiteNoise);
     noise_node.set_sample_rate(sample_rate);
 
-    let mixer = MoogOscillatorSection::new(
-        osc1_node,
-        osc2_node,
-        osc3_node,
-        noise_node,
-        preset.osc1.level,
-        preset.osc2.level,
-        preset.osc3.level,
-        preset.noise_level,
-    );
+    // Levels (incl. noise) are read live from the control slots inside the section.
+    let mixer = MoogOscillatorSection::new(osc1_node, osc2_node, osc3_node, noise_node, midi.clone());
 
     let filter_env = Adsr::new(
         AudioParam::Dynamic(Box::new(MidiGate(midi.clone()))),
-        AudioParam::Static(preset.filter.attack),
-        AudioParam::Static(preset.filter.decay),
-        AudioParam::Static(preset.filter.sustain),
-        AudioParam::Static(preset.filter.release),
+        live(&midi, slot::FILT_ATTACK),
+        live(&midi, slot::FILT_DECAY),
+        live(&midi, slot::FILT_SUSTAIN),
+        live(&midi, slot::FILT_RELEASE),
     );
 
     let cutoff_ctrl = MidiFilterCutoff(midi.clone());
 
     let mut cutoff_mod_chain = DspChain::new(cutoff_ctrl, sample_rate).and(Offset::new_param(
         AudioParam::Dynamic(Box::new(
-            DspChain::new(filter_env, sample_rate).and(Gain::new_fixed(preset.filter.env_amount)),
+            DspChain::new(filter_env, sample_rate).and(Gain::new(live(&midi, slot::FILT_ENV_AMT))),
         )),
     ));
 
     if let Some(lfo) = filter_lfo_node {
-        cutoff_mod_chain =
-            cutoff_mod_chain.and(Offset::new_param(AudioParam::Dynamic(Box::new(lfo))));
+        cutoff_mod_chain = cutoff_mod_chain.and(Offset::new_param(lfo));
     }
 
     let resonance_ctrl = MidiFilterResonance(midi.clone());
@@ -253,10 +221,10 @@ pub fn new_moog_voice(
 
     let amp_env = Adsr::new(
         AudioParam::Dynamic(Box::new(MidiGate(midi.clone()))),
-        AudioParam::Static(preset.amp.attack),
-        AudioParam::Static(preset.amp.decay),
-        AudioParam::Static(preset.amp.sustain),
-        AudioParam::Static(preset.amp.release),
+        live(&midi, slot::AMP_ATTACK),
+        live(&midi, slot::AMP_DECAY),
+        live(&midi, slot::AMP_SUSTAIN),
+        live(&midi, slot::AMP_RELEASE),
     );
 
     // Scale the amp envelope by note velocity (fixed, always-on velocity sensitivity), then

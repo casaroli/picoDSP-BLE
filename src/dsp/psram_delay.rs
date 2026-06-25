@@ -1,32 +1,34 @@
 //! Delay line whose ring buffer lives in external PSRAM.
 //!
-//! Faithful port of `infinitedsp_core::effects::time::delay::Delay` with the
-//! parameters fixed to static values (which is how the synth uses them) and the
-//! buffer backed by `crate::psram` instead of the SRAM heap. The per-sample
-//! buffer access pattern — two interpolation reads + one write head store — is
-//! identical to the stock delay, so swapping this in isolates the cost of
-//! putting that traffic on the QMI/PSRAM bus.
+//! Faithful port of `infinitedsp_core::effects::time::delay::Delay` with the buffer backed by
+//! `crate::psram` instead of the SRAM heap. Time / feedback / mix are read **live** each block
+//! from `MidiControl` slots (so the editor can sweep them via CC) — `time_mult` lets the L/R
+//! instances offset their times for a stereo spread off one slot. The per-sample buffer access
+//! pattern — two interpolation reads + one write head store — is identical to the stock delay,
+//! so swapping this in isolates the cost of putting that traffic on the QMI/PSRAM bus.
 
+use alloc::sync::Arc;
 use infinitedsp_core::FrameProcessor;
 use infinitedsp_core::core::channels::Mono;
+
+use crate::control::midi::{slot, MidiControl};
 
 pub struct PsramDelay {
     buffer: &'static mut [f32],
     write_ptr: usize,
-    delay_time: f32,
-    feedback: f32,
-    mix: f32,
+    control: Arc<MidiControl>,
+    /// Multiplier applied to the shared DELAY_TIME slot for this channel (1.0 = L, 1.15 = R).
+    time_mult: f32,
     sample_rate: f32,
 }
 
 impl PsramDelay {
-    /// `max_delay_seconds` sizes the ring buffer; `delay_time`/`feedback`/`mix`
-    /// are static (seconds, 0..1, 0..1). The buffer is allocated from PSRAM.
+    /// `max_delay_seconds` sizes the ring buffer; delay time / feedback / mix are read live
+    /// from `control` (slots DELAY_TIME/FEEDBACK/MIX). The buffer is allocated from PSRAM.
     pub fn new(
         max_delay_seconds: f32,
-        delay_time: f32,
-        feedback: f32,
-        mix: f32,
+        control: Arc<MidiControl>,
+        time_mult: f32,
         sample_rate: f32,
     ) -> Self {
         let size = (max_delay_seconds * sample_rate) as usize;
@@ -34,9 +36,8 @@ impl PsramDelay {
         Self {
             buffer,
             write_ptr: 0,
-            delay_time,
-            feedback,
-            mix,
+            control,
+            time_mult,
             sample_rate,
         }
     }
@@ -57,9 +58,12 @@ impl FrameProcessor<Mono> for PsramDelay {
             return;
         }
         let len_f = len as f32;
-        let delay_samples = self.delay_time * self.sample_rate;
-        let fb = self.feedback;
-        let mix = self.mix;
+        // Live params: read once per block (cheap atomic loads), same as the stock Delay reads
+        // its AudioParams per block. time_mult offsets L vs R for the stereo spread.
+        let delay_time = self.control.get_cont(slot::DELAY_TIME) * self.time_mult;
+        let delay_samples = delay_time * self.sample_rate;
+        let fb = self.control.get_cont(slot::DELAY_FEEDBACK);
+        let mix = self.control.get_cont(slot::DELAY_MIX);
 
         for sample in buffer.iter_mut() {
             let input = *sample;

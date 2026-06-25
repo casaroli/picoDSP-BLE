@@ -20,7 +20,7 @@ use crate::common::shared::{
     CORE1_STACK_SIZE, PRESET_CHANNEL, PSRAM_GATE_ACK, PSRAM_GATE_REQ, SAMPLE_RATE,
     disable_denormals,
 };
-use crate::control::midi::MidiControl;
+use crate::control::midi::{slot, AtomicParam, MidiControl};
 use crate::dsp::moog::new_moog_voice;
 use crate::dsp::psram_delay::PsramDelay;
 use crate::usb::logger::{LOG_CHANNEL, LogData, SYSTEM_STATUS_CHANNEL};
@@ -45,16 +45,18 @@ fn build_synth(
     midi_control: Arc<MidiControl>,
     preset: Preset,
 ) -> impl FrameProcessor<Stereo> + Send {
-    let voice = new_moog_voice(SAMPLE_RATE, midi_control, preset);
+    let voice = new_moog_voice(SAMPLE_RATE, midi_control.clone(), preset);
 
     // Rewind the PSRAM bump allocator before (re)building so preset switches
     // reuse the same region instead of leaking it. Safe because the previous
     // synth (holding the old PSRAM slices) is dropped before build_synth runs.
     crate::psram::reset_alloc();
 
+    // Live continuous param read from a control slot (delay/reverb amounts). Enable toggles
+    // are structural and rebuild the voice, so Bypass keeps its boolean here.
+    let live = |s: usize| AudioParam::Dynamic(Box::new(AtomicParam::new(midi_control.clone(), s)));
+
     let d = &preset.delay;
-    let time_l = d.time;
-    let time_r = d.time * 1.15;
 
     defmt::info!(
         "build_synth: delay enabled={} backend={}",
@@ -66,32 +68,33 @@ fn build_synth(
     // the vtable dispatch is once per 256-sample block (not per sample), so the
     // A/B delta is purely the buffer location. Delay::new hardcodes 44100 Hz, so
     // the SRAM arm pre-sizes to the real rate to avoid a realloc inside `.and()`.
-    let make_delay = |time: f32| -> Box<dyn FrameProcessor<Mono> + Send> {
+    // `time_mult` offsets L vs R off the single live DELAY_TIME slot for stereo width.
+    let make_delay = |time_mult: f32| -> Box<dyn FrameProcessor<Mono> + Send> {
         if USE_PSRAM_DELAY {
-            Box::new(PsramDelay::new(0.3, time, d.feedback, d.mix, SAMPLE_RATE))
+            Box::new(PsramDelay::new(0.3, midi_control.clone(), time_mult, SAMPLE_RATE))
         } else {
             let mut dl = Delay::new(
                 0.3,
-                AudioParam::Static(time),
-                AudioParam::Static(d.feedback),
-                AudioParam::Static(d.mix),
+                live(slot::DELAY_TIME),
+                live(slot::DELAY_FEEDBACK),
+                live(slot::DELAY_MIX),
             );
             dl.set_sample_rate(SAMPLE_RATE);
             Box::new(dl)
         }
     };
 
-    let delay_l = make_delay(time_l);
-    let delay_r = make_delay(time_r);
+    let delay_l = make_delay(1.0);
+    let delay_r = make_delay(1.15);
 
     let delay_node = ParallelMixer::new(1.0, DualMono::new(delay_l, delay_r));
     let delay_bypass = Bypass::new(delay_node, d.enabled != 0);
 
     let r = &preset.reverb;
-    let reverb =
-        Reverb::new_with_params(AudioParam::Static(r.size), AudioParam::Static(r.damping), 0);
+    let reverb = Reverb::new_with_params(live(slot::REVERB_SIZE), live(slot::REVERB_DAMPING), 0);
 
-    let reverb_node = ParallelMixer::new(r.mix, reverb);
+    let mut reverb_node = ParallelMixer::new(r.mix, reverb);
+    reverb_node.set_mix(live(slot::REVERB_MIX));
     let reverb_bypass = Bypass::new(reverb_node, r.enabled != 0);
 
     let widener = StereoWidener::new(AudioParam::Static(1.5));

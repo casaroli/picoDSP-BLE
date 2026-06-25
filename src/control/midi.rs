@@ -1,4 +1,5 @@
 use crate::common::shared::{BLE_MIDI_CHANNEL, COMMAND_CHANNEL, PRESET_CHANNEL, SystemCommand};
+use crate::data::presets::Preset;
 use crate::data::storage::{
     MAGIC as STORAGE_MAGIC, STORAGE_IMAGE_SIZE, Storage, VERSION as STORAGE_VERSION,
 };
@@ -37,14 +38,13 @@ const SYSEX_START: u8 = 0xF0;
 const SYSEX_END: u8 = 0xF7;
 
 const CC_MOD_WHEEL: u8 = 1;
-const CC_PORTAMENTO_TIME: u8 = 5;
 const CC_SUSTAIN: u8 = 64;
 /// Soft pedal (una corda). A full press→release gesture cycles to the next stored preset.
 const CC_SOFT_PEDAL: u8 = 67;
-const CC_FILTER_RESONANCE: u8 = 71;
-const CC_FILTER_CUTOFF: u8 = 74;
 const CC_ALL_SOUND_OFF: u8 = 120;
 const CC_ALL_NOTES_OFF: u8 = 123;
+// Portamento (CC5), filter resonance (CC71) and cutoff (CC74) plus all the editor's
+// DSP-parameter CCs are handled by `control::cc_map` in the catch-all arm below.
 
 const SYSEX_ID: u8 = 0x7D;
 const SYSEX_MODEL: u8 = 0x01;
@@ -129,6 +129,66 @@ impl NoteStack {
     }
 }
 
+/// Indices into `MidiControl::cont`, the array of live continuous DSP-parameter slots read
+/// per-block by the voice. `parameter_1`/`parameter_2` (filter cutoff/resonance) and
+/// `portamento` keep their own dedicated atoms; everything else the editor can sweep lives
+/// here. The DSP node for each slot reads it via `AtomicParam`. See `control::cc_map`.
+pub mod slot {
+    pub const OSC1_LEVEL: usize = 0;
+    /// Stores the frequency multiplier `2^octave`, not the octave itself.
+    pub const OSC1_OCTAVE: usize = 1;
+    pub const OSC1_DETUNE: usize = 2;
+    pub const OSC2_LEVEL: usize = 3;
+    pub const OSC2_OCTAVE: usize = 4;
+    pub const OSC2_DETUNE: usize = 5;
+    pub const OSC3_LEVEL: usize = 6;
+    pub const OSC3_OCTAVE: usize = 7;
+    pub const OSC3_DETUNE: usize = 8;
+    pub const NOISE: usize = 9;
+    pub const FILT_ENV_AMT: usize = 10;
+    pub const FILT_ATTACK: usize = 11;
+    pub const FILT_DECAY: usize = 12;
+    pub const FILT_SUSTAIN: usize = 13;
+    pub const FILT_RELEASE: usize = 14;
+    pub const AMP_ATTACK: usize = 15;
+    pub const AMP_DECAY: usize = 16;
+    pub const AMP_SUSTAIN: usize = 17;
+    pub const AMP_RELEASE: usize = 18;
+    pub const DELAY_TIME: usize = 19;
+    pub const DELAY_FEEDBACK: usize = 20;
+    pub const DELAY_MIX: usize = 21;
+    pub const REVERB_SIZE: usize = 22;
+    pub const REVERB_DAMPING: usize = 23;
+    pub const REVERB_MIX: usize = 24;
+    pub const LFO_FREQ: usize = 25;
+    pub const LFO_VIB_AMT: usize = 26;
+    pub const LFO_FILT_AMT: usize = 27;
+    pub const COUNT: usize = 28;
+
+    /// Per-oscillator slot helpers (`idx` = 0,1,2).
+    pub const fn osc_level(idx: usize) -> usize {
+        match idx {
+            0 => OSC1_LEVEL,
+            1 => OSC2_LEVEL,
+            _ => OSC3_LEVEL,
+        }
+    }
+    pub const fn osc_octave(idx: usize) -> usize {
+        match idx {
+            0 => OSC1_OCTAVE,
+            1 => OSC2_OCTAVE,
+            _ => OSC3_OCTAVE,
+        }
+    }
+    pub const fn osc_detune(idx: usize) -> usize {
+        match idx {
+            0 => OSC1_DETUNE,
+            1 => OSC2_DETUNE,
+            _ => OSC3_DETUNE,
+        }
+    }
+}
+
 pub struct MidiControl {
     target_freq_bits: AtomicU32,
     gate: AtomicBool,
@@ -139,6 +199,8 @@ pub struct MidiControl {
     velocity_bits: AtomicU32,
     parameter_1_bits: AtomicU32,
     parameter_2_bits: AtomicU32,
+    /// Live continuous DSP-parameter slots (see `slot`). Each holds an `f32` bit pattern.
+    cont: [AtomicU32; slot::COUNT],
 }
 
 impl MidiControl {
@@ -153,7 +215,59 @@ impl MidiControl {
             velocity_bits: AtomicU32::new(1.0f32.to_bits()),
             parameter_1_bits: AtomicU32::new(0.5f32.to_bits()),
             parameter_2_bits: AtomicU32::new(0.0f32.to_bits()),
+            cont: core::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
         }
+    }
+
+    /// Store an `f32` into a live continuous slot (see `slot`). Read by `AtomicParam`.
+    pub fn set_cont(&self, slot: usize, value: f32) {
+        self.cont[slot].store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Read the current value of a live continuous slot.
+    pub fn get_cont(&self, slot: usize) -> f32 {
+        f32::from_bits(self.cont[slot].load(Ordering::Relaxed))
+    }
+
+    /// Seed every live control from a preset so the DSP slots match it. Called when a preset
+    /// is (re)built. Continuous slots that the editor later sweeps via CC are overwritten in
+    /// place; a structural rebuild re-seeds here from the working preset, which already holds
+    /// the dialled-in values, so nothing snaps back.
+    pub fn seed_from_preset(&self, p: &Preset) {
+        let cutoff_norm = libm::log10f(p.filter.cutoff / 20.0) / libm::log10f(1000.0);
+        self.set_parameter_1(cutoff_norm.clamp(0.0, 1.0));
+        self.set_parameter_2(p.filter.resonance.clamp(0.0, 1.0));
+        self.set_portamento(p.portamento);
+
+        for (idx, osc) in [&p.osc1, &p.osc2, &p.osc3].iter().enumerate() {
+            self.set_cont(slot::osc_level(idx), osc.level);
+            self.set_cont(slot::osc_octave(idx), libm::powf(2.0, osc.octave));
+            self.set_cont(slot::osc_detune(idx), osc.detune);
+        }
+        self.set_cont(slot::NOISE, p.noise_level);
+
+        self.set_cont(slot::FILT_ENV_AMT, p.filter.env_amount);
+        self.set_cont(slot::FILT_ATTACK, p.filter.attack);
+        self.set_cont(slot::FILT_DECAY, p.filter.decay);
+        self.set_cont(slot::FILT_SUSTAIN, p.filter.sustain);
+        self.set_cont(slot::FILT_RELEASE, p.filter.release);
+
+        self.set_cont(slot::AMP_ATTACK, p.amp.attack);
+        self.set_cont(slot::AMP_DECAY, p.amp.decay);
+        self.set_cont(slot::AMP_SUSTAIN, p.amp.sustain);
+        self.set_cont(slot::AMP_RELEASE, p.amp.release);
+
+        self.set_cont(slot::DELAY_TIME, p.delay.time);
+        self.set_cont(slot::DELAY_FEEDBACK, p.delay.feedback);
+        self.set_cont(slot::DELAY_MIX, p.delay.mix);
+
+        self.set_cont(slot::REVERB_SIZE, p.reverb.size);
+        self.set_cont(slot::REVERB_DAMPING, p.reverb.damping);
+        self.set_cont(slot::REVERB_MIX, p.reverb.mix);
+
+        self.set_cont(slot::LFO_FREQ, p.lfo.frequency);
+        self.set_cont(slot::LFO_VIB_AMT, p.lfo.vibrato_amount);
+        self.set_cont(slot::LFO_FILT_AMT, p.lfo.filter_amount);
     }
 
     pub fn set_freq(&self, freq: f32) {
@@ -403,6 +517,40 @@ impl FrameProcessor<Mono> for MidiFilterResonance {
     }
 }
 
+/// A control signal that emits the current value of one live continuous slot (see `slot`),
+/// constant across the block. Wrap in `AudioParam::Dynamic` to feed any DSP node param
+/// (Gain/Offset/Adsr/Reverb/...) so the editor can sweep it live without a voice rebuild.
+pub struct AtomicParam {
+    control: Arc<MidiControl>,
+    slot: usize,
+}
+
+impl AtomicParam {
+    pub fn new(control: Arc<MidiControl>, slot: usize) -> Self {
+        Self { control, slot }
+    }
+}
+
+impl FrameProcessor<Mono> for AtomicParam {
+    fn process(&mut self, buffer: &mut [f32], _frame_index: u64) {
+        let val = self.control.get_cont(self.slot);
+        for sample in buffer.iter_mut() {
+            *sample = val;
+        }
+    }
+    fn set_sample_rate(&mut self, _sample_rate: f32) {}
+    fn reset(&mut self) {}
+    fn latency_samples(&self) -> u32 {
+        0
+    }
+    fn name(&self) -> &str {
+        "AtomicParam"
+    }
+    fn visualize(&self, _indent: usize) -> alloc::string::String {
+        "AtomicParam".into()
+    }
+}
+
 /// Load the preset at `index` from flash, map its parameters onto the live controls and
 /// hand it to the DSP via `PRESET_CHANNEL`. Shared by Program Change and the soft-pedal
 /// preset cycling. The caller owns `current_preset_index`.
@@ -410,13 +558,12 @@ async fn load_and_apply_preset(
     storage: &mut Storage<'static>,
     index: usize,
     midi_control: &MidiControl,
+    working_preset: &mut Preset,
 ) {
     if let Some(preset) = storage.load_preset(index).await {
         log_midi!("Loaded: {}\r\n", preset.get_name());
-        let cutoff_norm = libm::log10f(preset.filter.cutoff / 20.0) / libm::log10f(1000.0);
-        midi_control.set_parameter_1(cutoff_norm.clamp(0.0, 1.0));
-        midi_control.set_parameter_2(preset.filter.resonance.clamp(0.0, 1.0));
-        midi_control.set_portamento(preset.portamento);
+        midi_control.seed_from_preset(&preset);
+        *working_preset = preset;
         let _ = PRESET_CHANNEL.try_send(preset);
     } else {
         log_midi!("Preset {} not found\r\n", index);
@@ -503,6 +650,7 @@ async fn handle_sysex(
     sender: &mut Sender<'static, Driver<'static, USB>>,
     midi_control: &MidiControl,
     current_preset_index: usize,
+    working_preset: &mut Preset,
 ) {
     match cmd {
         CMD_DUMP_REQ => {
@@ -534,7 +682,8 @@ async fn handle_sysex(
                     current_preset_index
                 );
                 send_sysex_status(sender, CMD_WRITE_SUCCESS, None).await;
-                load_and_apply_preset(storage, current_preset_index, midi_control).await;
+                load_and_apply_preset(storage, current_preset_index, midi_control, working_preset)
+                    .await;
             } else {
                 log_midi!(
                     "SysEx: Invalid Magic/Version ({:X}, {})\r\n",
@@ -565,6 +714,7 @@ async fn handle_voice_message(
     midi_control: &MidiControl,
     storage: &mut Storage<'static>,
     current_preset_index: &mut usize,
+    working_preset: &mut Preset,
 ) {
     log_midi!("MIDI: [{:02X}-{:02X}-{:02X}] - ", status, d1, d2);
 
@@ -600,11 +750,6 @@ async fn handle_voice_message(
                     log_midi!("MOD WHEEL: {:.2}", val_norm);
                     midi_control.set_mod_wheel(val_norm);
                 }
-                CC_PORTAMENTO_TIME => {
-                    let amount = val_norm;
-                    log_midi!("PORTAMENTO: {:.2}", amount);
-                    midi_control.set_portamento(amount);
-                }
                 CC_SUSTAIN => {
                     let sustain_on = d2 >= 64;
                     log_midi!("SUSTAIN: {}", if sustain_on { "ON" } else { "OFF" });
@@ -630,20 +775,15 @@ async fn handle_voice_message(
                             *current_preset_index = (*current_preset_index + 1) % count;
                             log_midi!("SOFT PEDAL: next preset {}\r\n", *current_preset_index);
                             defmt::info!("SOFT PEDAL -> preset {=usize}", *current_preset_index);
-                            load_and_apply_preset(storage, *current_preset_index, midi_control)
-                                .await;
+                            load_and_apply_preset(
+                                storage,
+                                *current_preset_index,
+                                midi_control,
+                                working_preset,
+                            )
+                            .await;
                         }
                     }
-                }
-                CC_FILTER_RESONANCE => {
-                    log_midi!("RESONANCE: {:.2}", val_norm);
-                    defmt::info!("PARAM resonance <- {=f32}", val_norm);
-                    midi_control.set_parameter_2(val_norm);
-                }
-                CC_FILTER_CUTOFF => {
-                    log_midi!("CUTOFF: {:.2}", val_norm);
-                    defmt::info!("PARAM cutoff <- {=f32}", val_norm);
-                    midi_control.set_parameter_1(val_norm);
                 }
                 CC_ALL_SOUND_OFF | CC_ALL_NOTES_OFF => {
                     log_midi!("ALL NOTES/SOUND OFF");
@@ -651,14 +791,32 @@ async fn handle_voice_message(
                     midi_control.reset();
                     let _ = LED_SIGNAL_CHANNEL.try_send(false);
                 }
-                _ => {}
+                cc => {
+                    // Every editor-editable DSP parameter (incl. cutoff CC74, resonance CC71,
+                    // portamento CC5). Continuous params update live; structural ones (osc
+                    // waveform/vibrato, FX enable) need the voice rebuilt from the working
+                    // preset, which `apply_cc` keeps in sync for every CC.
+                    if let Some(structural) =
+                        crate::control::cc_map::apply_cc(cc, d2, working_preset, midi_control)
+                    {
+                        defmt::info!(
+                            "PARAM cc {=u8} <- {=u8}{=str}",
+                            cc,
+                            d2,
+                            if structural { " (rebuild)" } else { "" }
+                        );
+                        if structural {
+                            let _ = PRESET_CHANNEL.try_send(*working_preset);
+                        }
+                    }
+                }
             }
         }
         PROGRAM_CHANGE => {
             log_midi!("PROGRAM CHANGE: {}\r\n", d1);
             defmt::info!("PROGRAM CHANGE -> preset {=u8}", d1);
             *current_preset_index = d1 as usize;
-            load_and_apply_preset(storage, d1 as usize, midi_control).await;
+            load_and_apply_preset(storage, d1 as usize, midi_control, working_preset).await;
         }
         PITCH_BEND => {
             let val = ((d2 as u16) << 7) | (d1 as u16);
@@ -699,6 +857,15 @@ pub async fn midi_task(
 
     let mut current_preset_index = 4;
 
+    // RAM mirror of the live patch. core1 boots on preset 4 (see main()), so start there.
+    // Every CC edit mutates this in place; a structural CC pushes a clone to PRESET_CHANNEL
+    // to rebuild the voice, preserving all prior live tweaks. RAM-only — flash is untouched
+    // until a SysEx bank write.
+    let mut working_preset = storage
+        .load_preset(current_preset_index)
+        .await
+        .unwrap_or_default();
+
     // De-nibbleized SysEx image buffer. Incoming WRITE nibbles are decoded on the fly into
     // here (2 nibbles -> 1 byte) so the 2x-larger nibbleized stream is never held in RAM; a
     // DUMP reads the storage image into the same buffer. ~28 KB, sits alongside the synth.
@@ -736,6 +903,7 @@ pub async fn midi_task(
                     midi_control.as_ref(),
                     &mut storage,
                     &mut current_preset_index,
+                    &mut working_preset,
                 )
                 .await;
                 continue;
@@ -802,6 +970,7 @@ pub async fn midi_task(
                                                 &mut sender,
                                                 midi_control.as_ref(),
                                                 current_preset_index,
+                                                &mut working_preset,
                                             )
                                             .await;
                                         }
@@ -832,6 +1001,7 @@ pub async fn midi_task(
                                 midi_control.as_ref(),
                                 &mut storage,
                                 &mut current_preset_index,
+                                &mut working_preset,
                             )
                             .await;
                         }
@@ -856,6 +1026,7 @@ pub async fn midi_task(
                         midi_control.as_ref(),
                         &mut storage,
                         &mut current_preset_index,
+                        &mut working_preset,
                     )
                     .await;
                 }
