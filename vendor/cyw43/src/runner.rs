@@ -35,8 +35,13 @@ const BT_POLL_PERIOD_ACTIVE: Duration = Duration::from_micros(250);
 /// before falling back to the idle period. Sized so a single host<->radio round-trip's
 /// response latency comfortably fits inside the fast window. Any serviced work or host TX
 /// refreshes the budget.
+///
+/// Kept small on purpose: the init burst (firmware/CLM/HCI) keeps it refreshed via continuous
+/// activity so startup stays fast regardless, while in steady state it drops back to the gentle
+/// idle period within ~`BUDGET * ACTIVE` after each event. Long fast-poll windows during play
+/// flood the shared bus with radio SPI and audibly click the audio output, so we drain quickly.
 #[cfg(feature = "bluetooth")]
-const BT_FAST_POLL_BUDGET: u32 = 64;
+const BT_FAST_POLL_BUDGET: u32 = 8;
 
 #[cfg(feature = "firmware-logs")]
 struct LogState {

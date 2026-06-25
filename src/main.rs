@@ -93,6 +93,14 @@ async fn main(spawner: Spawner) {
     init_ram_code();
     let p = embassy_rp::init(Default::default());
 
+    // Give the DMA masters high priority on the bus fabric so the core1 DSP's heavy SRAM
+    // traffic can't starve the audio output DMA (which would underflow the I2S PIO FIFO and
+    // click). Pairs with the per-channel I2S high-priority bit set in main_task.
+    embassy_rp::pac::BUSCTRL.bus_priority().write(|w| {
+        w.set_dma_r(true);
+        w.set_dma_w(true);
+    });
+
     // Log the bootrom flash XIP config, raise CS0 to clk_sys/2 with an RXDELAY sweep,
     // then log again to confirm the new divisor. Runs single-core before core1/PSRAM/
     // DMA/USB start, so the sweep is the only flash user while it retimes CS0.

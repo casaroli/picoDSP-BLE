@@ -51,6 +51,15 @@ pub async fn main_task(
     loop {
         let dma_future = i2s.write(front_buffer);
 
+        // Give the I2S output DMA preferential treatment in the DMA scheduler so the cyw43
+        // radio's SPI bursts (DMA_CH2, also DMA-driven) can't delay it and underflow the PIO
+        // FIFO. The I2S DMA is DMA_CH1; embassy rewrites its ctrl_trig on every write(),
+        // clearing the bit, so re-assert it each block.
+        embassy_rp::pac::DMA
+            .ch(1)
+            .ctrl_trig()
+            .modify(|w| w.set_high_priority(true));
+
         // Observe the output queue depth before we block on it: empty == the DSP producer
         // failed to keep up for this block == an audible underrun. Track the low-water-mark
         // and count empties so the log shows whether bursts are actually causing glitches.
