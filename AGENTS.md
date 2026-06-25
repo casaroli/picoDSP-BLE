@@ -1,0 +1,93 @@
+# AGENTS.md — rp2350-synth
+
+Guide for agents working on this repo. Read this first.
+
+## What this is
+
+A polyphonic-voiced (mono-priority) **synthesizer firmware** for the **RP2350**
+(Raspberry Pi Pico Plus 2 W). `no_std` Rust, **Embassy** async, dual-core. It plays from
+**USB-MIDI** and **BLE-MIDI** (a Bluetooth keyboard), outputs audio over **I2S**, and stores
+**17 factory presets** in flash.
+
+## Build / flash / run
+
+- **Flash + stream logs:** `cargo run --release` (runner is `probe-rs run --chip RP235x`).
+- Target: `thumbv8m.main-none-eabihf`. Log level: `DEFMT_LOG=info` (set in `.cargo/config`).
+- Logs are **defmt over RTT** (shown by `probe-rs`). MIDI/storage logs (`log_midi!`,
+  `log_status!`) go over **USB-serial**, not RTT.
+- The board's CYW43 radio is a separate chip; a soft reset / re-flash toggles its PWR pin but
+  occasionally it needs a **physical USB power-cycle** (e.g. wedged radio, or to clear state).
+- **Intermittent slow startup:** cyw43 `control.init` sometimes takes tens of seconds (seen
+  up to ~135 s) before `[host] initialized`. This is a known, pre-existing flaky behaviour —
+  not a hang. Don't mistake it for a crash; wait it out or power-cycle.
+
+### Host tool: `tools/midictl`
+
+Tiny `midir` CLI to drive the synth over USB-MIDI without a DAW. Auto-targets the `PicoDSP`
+port. Has its own `.cargo/config.toml` (host target). Examples:
+`cargo run -- pc 12` (load preset), `cargo run -- note 60 8` (hold note),
+`cargo run -- cc 67 127 && cargo run -- cc 67 0` (soft-pedal preset cycle). See its README.
+
+## Architecture
+
+- **core0** (`src/tasks/core0.rs` `main_task`): USB device (UAC1 audio + MIDI + serial log),
+  the **I2S output feed** (DSP block -> double-buffered DMA), storage, and spawns the
+  BLE host. Also runs the cyw43 runner.
+- **core1** (`src/tasks/core1.rs` `core1_task`): the **DSP**. `build_synth` builds an
+  `infinitedsp-core` chain (3 osc voice -> ladder filter -> VCA -> delay -> reverb -> widener)
+  and the loop produces `BLOCK_SIZE` (256) blocks into `AUDIO_CHANNEL`.
+- **Audio path:** core1 -> `AUDIO_CHANNEL` (cap 4) -> core0 `main_task` -> `PioI2sOut`
+  (PIO0 + **DMA_CH1**), 48 kHz / 16-bit. `AUDIO_UNDERRUNS` counts the *software* channel
+  emptying — it does **not** see PIO-FIFO output underflows (the audio "clicks"; see below).
+- **MIDI:** USB-MIDI and BLE-MIDI both funnel into `handle_voice_message`
+  (`src/control/midi.rs`). `MidiControl` (atomics) carries freq/gate/params to core1.
+  CC67 (soft pedal) press->release **cycles presets**.
+- **BLE** (`src/bt/mod.rs`, core0): cyw43 radio (`PioSpi` PIO1 + **DMA_CH2**) +
+  TrouBLE host as a **Central** that scans for, pairs with (LE Legacy JustWorks + bonding),
+  and subscribes to a BLE-MIDI keyboard; decodes BLE-MIDI notifications into
+  `BLE_MIDI_CHANNEL`. Requests a 15–30 ms connection interval (keyboard pulls to ~7.5 ms).
+- **Storage** (`src/data/storage.rs`): one 4 KB flash sector at top of flash. Header
+  (magic/version/count) + N x 200-byte `Preset`. **Max 20 presets** fit the sector
+  (`16 + N*200 <= 4096`). Bump `VERSION` to force a reformat with new defaults. Currently
+  `VERSION = 8`, 17 presets (`src/data/presets.rs` `get_default_presets`).
+- **PSRAM** (`src/psram.rs`): 8 MiB APS6404L on QMI CS1, backs the delay ring buffers. Shares
+  the QMI bus with flash — flash writes need a settle + CS1 reinit + a core1 PSRAM gate
+  (`PSRAM_GATE_REQ/ACK`). See `docs/psram-flash-corruption-investigation.md`.
+
+## Vendored crates (`vendor/`) — patched via `[patch]` in `Cargo.toml`
+
+Do not assume upstream behaviour; these are **locally patched**. If you bump a revision,
+**re-apply the patch**.
+
+- **`vendor/cyw43`** — busy-poll runner with an **adaptive poll cadence**: fast (250 µs)
+  while traffic flows, decaying to an 8 ms idle period via a small budget (`BT_FAST_POLL_BUDGET
+  = 8`). Fixes a ~50 s startup *and* limits steady-state bus flooding (audio clicks).
+- **`vendor/trouble`** (trouble-host) — patched so the **L2CAP Connection Parameter Update
+  *response* echoes the request's signaling identifier** (Core spec Vol 3 Part A §4.1).
+  Without it the keyboard's RTX timer expires and it drops the link every ~30 s. Built with
+  the `legacy-pairing` feature (the keyboard is LE-Legacy, no Secure Connections).
+- **`vendor/infinitedsp-core`** (0.9.0) — the **sine oscillator's per-sample `libm::sinf`**
+  (~1100 cycles on RP2350; ~90 % of a block!) replaced with a **fast polynomial**
+  (`fast_sin_norm`, ~16 % cost). Without it, sine-based presets underflow into silence+noise.
+
+## Known issues / open work
+
+- **BLE-radio audio clicks under load** (open): dense CC streams still click. Root cause and
+  the reverted interrupt-executor attempt are written up in
+  **`docs/audio-clicks-ble-contention.md`** — read it before touching the audio path.
+- **PSRAM-across-flash corruption**: largely worked around; details in
+  `docs/psram-flash-corruption-investigation.md`.
+
+## Conventions
+
+- **Commit directly to the current branch** (incl. `master`); do not auto-create branches.
+- Match surrounding code style. Keep the firmware `no_std`.
+- When verifying changes, prefer flashing and reading the actual logs/audio over assuming.
+
+## Current uncommitted state (as of this writing)
+
+`src/main.rs` has the **boot diagnostics removed** (flash-XIP config logging, `psram::bench`,
+the PSRAM-across-flash verify block) for a quieter/faster boot — **intentionally left
+uncommitted**. The protective `psram::self_test` and the functional `speed_up_flash_xip`
+remain. Everything else is committed (fast sine, click mitigations, presets, CC67, tool,
+docs).
