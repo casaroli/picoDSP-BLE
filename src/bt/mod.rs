@@ -438,6 +438,11 @@ pub async fn bluetooth_task(
                             BT_CONNECTED.store(true, Ordering::Relaxed);
                             run_gatt(&stack, &conn).await;
                             BT_CONNECTED.store(false, Ordering::Relaxed);
+                            // The link just dropped while notes may still be held. Push an
+                            // All Notes Off (CC123) through the same channel a real message
+                            // takes so midi_task clears the note stack and closes the gate —
+                            // otherwise a note held at disconnect sticks on until reconnect.
+                            let _ = BLE_MIDI_CHANNEL.try_send([0xB0, 123, 0]);
                         }
                         info!("[bt] disconnected, rescanning");
                     }
