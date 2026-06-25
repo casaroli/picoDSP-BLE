@@ -1251,8 +1251,6 @@ dependencies = [
 [[package]]
 name = "infinitedsp-core"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25efd6148025faf05c780dade18ddc9b0ce82da144a617bb22878c132564cda2"
 dependencies = [
  "libm",
  "microfft",
