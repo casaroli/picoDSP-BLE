@@ -11,8 +11,9 @@ use bt_hci::param::LeAdvReportsIter;
 use cyw43::aligned_bytes;
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::{info, warn};
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_futures::join::join;
-use embassy_futures::select::select;
+use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH2, PIN_23, PIN_24, PIN_25, PIN_29, PIO1, TRNG};
@@ -47,13 +48,33 @@ const L2CAP_CHANNELS_MAX: usize = 3;
 /// Max GATT services we keep handles for during discovery.
 const MAX_SERVICES: usize = 4;
 
+/// Set by the central loop while a keyboard is connected; cleared while scanning. Lets the
+/// LED show a "searching" heartbeat without a connection, then hand the LED back to the
+/// note-on/off indicator once connected.
+static BT_CONNECTED: AtomicBool = AtomicBool::new(false);
+
 /// Drives the onboard LED, which on the Pico Plus 2 W lives on CYW43 GPIO 0 (the bare RP2350
-/// `PIN_25` the LED used to use is now the radio's SPI chip-select). Reuses the existing
-/// note-on/off `LED_SIGNAL_CHANNEL` so the LED still blinks with played notes.
+/// `PIN_25` the LED used to use is now the radio's SPI chip-select).
+///
+/// While disconnected it blinks a short heartbeat (100 ms on every 1 s) to show we're
+/// scanning. Once connected it reuses the note-on/off `LED_SIGNAL_CHANNEL` so the LED blinks
+/// with played notes.
 async fn led_loop(mut control: cyw43::Control<'static>) {
     loop {
-        let state = LED_SIGNAL_CHANNEL.receive().await;
-        control.gpio_set(0, state).await;
+        if BT_CONNECTED.load(Ordering::Relaxed) {
+            // Connected: LED follows played notes. Cap the wait at 1 s so we resume the
+            // scanning heartbeat promptly after a disconnect even with no note activity.
+            match select(LED_SIGNAL_CHANNEL.receive(), Timer::after(Duration::from_secs(1))).await {
+                Either::First(state) => control.gpio_set(0, state).await,
+                Either::Second(_) => {}
+            }
+        } else {
+            // Scanning: short heartbeat blink, 100 ms on / 900 ms off.
+            control.gpio_set(0, true).await;
+            Timer::after(Duration::from_millis(100)).await;
+            control.gpio_set(0, false).await;
+            Timer::after(Duration::from_millis(900)).await;
+        }
     }
 }
 
@@ -375,6 +396,8 @@ pub async fn bluetooth_task(
                     // which adds up to 80 ms of MIDI latency/jitter. Request a 15–30 ms window
                     // instead: ~3–5× lower latency while leaving the radio enough idle time that
                     // its SPI/QMI traffic doesn't starve the core1 PSRAM DSP (audio underruns).
+                    // The keyboard then pulls it down to ~7.5 ms via an L2CAP param-update
+                    // request, which we accept (see the patched trouble-host in vendor/trouble).
                     connect_params: RequestedConnParams {
                         min_connection_interval: Duration::from_millis(15),
                         max_connection_interval: Duration::from_millis(30),
@@ -394,7 +417,9 @@ pub async fn bluetooth_task(
                         // drops we fall through and rescan rather than spinning on a 0x05
                         // (Insufficient Authentication) subscribe.
                         if pair(&stack, &conn).await {
+                            BT_CONNECTED.store(true, Ordering::Relaxed);
                             run_gatt(&stack, &conn).await;
+                            BT_CONNECTED.store(false, Ordering::Relaxed);
                         }
                         info!("[bt] disconnected, rescanning");
                     }
