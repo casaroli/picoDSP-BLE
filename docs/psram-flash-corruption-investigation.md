@@ -350,6 +350,33 @@ Useful registers: `embassy_rp::pac::QMI.mem(1).{timing,rfmt,rcmd,wfmt,wcmd}()`,
 
 ## 9. Open residual — what to investigate next
 
+> **UPDATE 2026-06-25 — first-op hypothesis CONFIRMED (at clk_sys 200 MHz).**
+> Ran experiment #1 (repeat the flash op 3× in one boot, re-seeding the full 64 KiB
+> pattern before each so every count is independent):
+> ```
+> PSRAM xflash@200MHz op 1: pre 0/8192 post 28/8192
+> PSRAM xflash@200MHz op 2: pre 0/8192 post  0/8192
+> PSRAM xflash@200MHz op 3: pre 0/8192 post  0/8192
+> ```
+> **Only the first flash op after boot corrupts content; ops 2+ are bit-perfect** with
+> the exact same settle+reinit. This resolves "the central open question" below: the
+> §RESOLUTION sweep read 0 because those were 2nd/3rd ops. It is a genuine
+> **first-op-after-boot** state, not a too-short settle.
+> Also: the 28/8192 op-1 residual is unchanged from the 150 MHz baseline (20–28), so the
+> **150→200 MHz overclock (PSRAM 75→100 MHz SCK) is NOT a regression** — see
+> `[[overclock-200mhz-psram]]`.
+> **Implied fix:** a one-time dummy warm-up flash op (erase/program → settle → reinit)
+> makes the first *real* write behave like op-2. Cheap; should make saves bit-perfect.
+> **Placement caveat (learned the hard way):** the warm-up must run *post-core1* — doing
+> it pre-core1 (right after `needs_format`) reintroduces a pre-core1 flash WRITE, which
+> per `main.rs` desyncs the bootrom SIO-FIFO echo and **hangs the boot** (and wedges RTT
+> so you see no logs at all). A first attempt placed `storage.warmup()` pre-core1 and hung
+> exactly this way (the earlier 3× harness only survived by luck within the "handful of
+> ops" budget). Put the warm-up as the **first flash op inside `midi_task`**, before the
+> deferred format/bank-write, so the format's first sector is op-2. (Experiments #2/#4/#5
+> below no longer needed for the diagnosis; a post-core1 warm-up + re-measure is the next
+> step.)
+
 **What's solved:** the delay survives a save with clean audio (live-confirmed). Mechanism
 is a post-flash **recovery window**, not erase-time decay; the cure is **idle settle (≥100 µs,
 we use 1 ms) + full `Psram::new` re-init** (register-only restore is NOT enough — §RESOLUTION
