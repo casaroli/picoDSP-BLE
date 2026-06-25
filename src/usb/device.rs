@@ -12,6 +12,7 @@ use crate::common::shared::{COMMAND_CHANNEL, SystemCommand};
 use crate::usb::uac1::{self, Microphone, Uac1MicrophoneClass};
 
 pub type UsbSender = Sender<'static, Driver<'static, USB>>;
+pub type UsbMicrophone = Microphone<'static, Driver<'static, USB>>;
 
 static mut CONFIG_DESC: [u8; 512] = [0; 512];
 static mut BOS_DESC: [u8; 256] = [0; 256];

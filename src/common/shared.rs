@@ -38,9 +38,16 @@ pub const HEAP_SIZE: usize = 168000;
 pub const BLOCK_SIZE: usize = 256;
 pub const CORE1_STACK_SIZE: usize = 16384;
 
+#[derive(Clone, Copy)]
 pub struct AudioData {
     pub buffer: [f32; BLOCK_SIZE],
 }
+
+/// Set by the UAC1 handler when the host opens (alt setting >= 1) the audio-streaming
+/// interface, cleared when it closes/de-configures/suspends. The microphone task only
+/// writes isochronous IN packets while this is true — an unpolled iso IN endpoint would
+/// otherwise block the write forever. See `usb::uac1::Control`.
+pub static USB_AUDIO_STREAMING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 pub enum SystemCommand {
@@ -48,6 +55,11 @@ pub enum SystemCommand {
 }
 
 pub static AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioData, 4> = Channel::new();
+/// Secondary best-effort tee of the audio blocks for the USB UAC1 microphone stream. The
+/// I2S loop (the real-time timing master) `try_send`s each block here and never blocks on it;
+/// `microphone_task` drains it. If USB is closed or can't keep up, sends are dropped so the
+/// DAC output is never disturbed.
+pub static USB_AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioData, 4> = Channel::new();
 pub static PRESET_CHANNEL: Channel<CriticalSectionRawMutex, Preset, 1> = Channel::new();
 pub static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, SystemCommand, 2> = Channel::new();
 
