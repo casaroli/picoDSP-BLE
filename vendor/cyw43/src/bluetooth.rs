@@ -412,7 +412,9 @@ impl<'a> BtRunner<'a> {
         return false;
     }
 
-    pub(crate) async fn handle_irq(&mut self, bus: &mut impl Bus) {
+    /// Returns `true` if there was BT work to service (so the runner can keep polling fast
+    /// while HCI traffic is flowing instead of falling back to the idle throttle).
+    pub(crate) async fn handle_irq(&mut self, bus: &mut impl Bus) -> bool {
         if self.bt_has_work(bus).await {
             loop {
                 // Check if we have data.
@@ -464,6 +466,9 @@ impl<'a> BtRunner<'a> {
 
                 self.bt_toggle_intr(bus).await;
             }
+            true
+        } else {
+            false
         }
     }
 }

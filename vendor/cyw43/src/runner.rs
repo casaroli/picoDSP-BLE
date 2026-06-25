@@ -17,10 +17,26 @@ use crate::util::{aligned_mut, aligned_ref, slice8_mut, slice16_mut, try_until};
 use crate::{CHIP, Core, MTU, events};
 
 /// LOCAL PATCH: idle polling period for the bluetooth HCI path (see `Runner::run`).
-/// Bounds the extra BT-RX latency while keeping core0 off the shared bus the rest of
-/// the time. 1ms is far below the BLE connection interval, so MIDI feels instant.
+/// Idle BT poll period. Bounds the extra BT-RX latency while keeping core0 off the shared
+/// bus the rest of the time. 8ms is far below the BLE connection interval, so MIDI feels
+/// instant once connected, while leaving the QMI/XIP bus free for the core1 DSP.
 #[cfg(feature = "bluetooth")]
 const BT_POLL_PERIOD: Duration = Duration::from_micros(8000);
+
+/// Active BT poll period, used while HCI traffic is actively flowing (firmware/CLM/Wi-Fi
+/// bringup and BLE bursts). The idle 8ms period throttles *every* host<->radio round-trip,
+/// including the thousands of small ioctls in `control.init()`, which otherwise stretches
+/// startup to ~50s. Polling every 250us while busy keeps those round-trips snappy without
+/// busy-spinning the bus (each poll still yields to the executor for the period).
+#[cfg(feature = "bluetooth")]
+const BT_POLL_PERIOD_ACTIVE: Duration = Duration::from_micros(250);
+
+/// How many consecutive idle polls (no Wi-Fi/BT work serviced) to stay in the fast cadence
+/// before falling back to the idle period. Sized so a single host<->radio round-trip's
+/// response latency comfortably fits inside the fast window. Any serviced work or host TX
+/// refreshes the budget.
+#[cfg(feature = "bluetooth")]
+const BT_FAST_POLL_BUDGET: u32 = 64;
 
 #[cfg(feature = "firmware-logs")]
 struct LogState {
@@ -460,6 +476,10 @@ where
     /// Run the CYW43 event handling loop.
     pub async fn run(mut self) -> ! {
         let mut buf = [0; 512];
+        // Start in the fast cadence so the bursty Wi-Fi/BT bringup (`control.init`, CLM
+        // download, firmware HCI) isn't throttled; it decays to the idle period once quiet.
+        #[cfg(feature = "bluetooth")]
+        let mut fast_poll: u32 = BT_FAST_POLL_BUDGET;
         loop {
             #[cfg(feature = "firmware-logs")]
             self.log_read().await;
@@ -484,12 +504,16 @@ where
                 // LOCAL PATCH: the upstream busy-poll uses `core::future::ready(())`, which
                 // makes this runner spin flat-out on core0, thrashing the shared XIP cache /
                 // SRAM bus and starving the DSP on core1 (audio stutter, ~3x slower process()).
-                // Throttle the idle BT poll to a fixed period instead: bt_tx still fires
-                // immediately, and incoming HCI is picked up every `BT_POLL_PERIOD` with that
-                // much added latency at most (negligible for BLE-MIDI vs the connection
-                // interval). This frees the bus for core1 the rest of the time.
+                // Instead poll on a timer whose period adapts to activity: a short
+                // `BT_POLL_PERIOD_ACTIVE` while traffic is flowing (so bringup and BLE bursts
+                // stay responsive) decaying to the idle `BT_POLL_PERIOD` once quiet, which
+                // frees the bus for core1. `bt_tx` still fires immediately on host TX.
                 #[cfg(feature = "bluetooth")]
-                let ev = Timer::after(BT_POLL_PERIOD);
+                let ev = Timer::after(if fast_poll > 0 {
+                    BT_POLL_PERIOD_ACTIVE
+                } else {
+                    BT_POLL_PERIOD
+                });
                 #[cfg(not(feature = "bluetooth"))]
                 let ev = self.bus.wait_for_event();
 
@@ -500,11 +524,21 @@ where
                         cmd,
                         iface,
                     }) => {
+                        // Host-initiated ioctl: its completion arrives via handle_irq, so
+                        // poll fast for it.
+                        #[cfg(feature = "bluetooth")]
+                        {
+                            fast_poll = BT_FAST_POLL_BUDGET;
+                        }
                         self.send_ioctl(kind, cmd, iface, unsafe { &*iobuf }, &mut buf).await;
                         self.check_status(&mut buf).await;
                     }
                     Either4::Second(packet) => {
                         trace!("tx pkt {:02x}", Bytes(&packet[..packet.len().min(48)]));
+                        #[cfg(feature = "bluetooth")]
+                        {
+                            fast_poll = BT_FAST_POLL_BUDGET;
+                        }
 
                         let buf8 = slice8_mut(&mut buf);
 
@@ -558,11 +592,29 @@ where
                         self.check_status(&mut buf).await;
                     }
                     Either4::Third(_) => {
+                        // Host sent an HCI packet; its response arrives via handle_irq, so
+                        // poll fast until it (and any follow-on) is drained.
                         #[cfg(feature = "bluetooth")]
-                        self.bt.as_mut().unwrap().hci_write(&mut self.bus).await;
+                        {
+                            fast_poll = BT_FAST_POLL_BUDGET;
+                            self.bt.as_mut().unwrap().hci_write(&mut self.bus).await;
+                        }
                     }
                     Either4::Fourth(()) => {
-                        self.handle_irq(&mut buf).await;
+                        let did_work = self.handle_irq(&mut buf).await;
+
+                        // Stay in the fast cadence while work keeps arriving; once a poll
+                        // finds nothing, decay the budget back toward the idle period.
+                        #[cfg(feature = "bluetooth")]
+                        {
+                            if did_work {
+                                fast_poll = BT_FAST_POLL_BUDGET;
+                            } else {
+                                fast_poll = fast_poll.saturating_sub(1);
+                            }
+                        }
+                        #[cfg(not(feature = "bluetooth"))]
+                        let _ = did_work;
 
                         // If we do busy-polling, make sure to yield.
                         // `handle_irq` will only do a 32bit read if there's no work to do, which is really fast.
@@ -590,7 +642,10 @@ where
     }
 
     /// Wait for IRQ on F2 packet available
-    async fn handle_irq(&mut self, buf: &mut [u32; 512]) {
+    /// Returns `true` if any work was serviced (a Wi-Fi packet was available or there was
+    /// pending BT HCI data). The run loop uses this to keep polling fast while traffic is
+    /// flowing and only fall back to the idle throttle once things go quiet.
+    async fn handle_irq(&mut self, buf: &mut [u32; 512]) -> bool {
         match BUS::TYPE {
             BusType::Sdio => {
                 // TODO: get irqs working
@@ -622,6 +677,7 @@ where
                         .bp_write32(CHIP.sdiod_core_base_address + SDIO_INT_STATUS, irq & HOSTINTMASK)
                         .await;
                 }
+                irq & I_HMB_HOST_INT != 0
             }
             BusType::Spi => {
                 // Receive stuff
@@ -630,7 +686,8 @@ where
                     trace!("irq{}", FormatInterrupt(irq));
                 }
 
-                if irq & IRQ_F2_PACKET_AVAILABLE != 0 {
+                let wifi_work = irq & IRQ_F2_PACKET_AVAILABLE != 0;
+                if wifi_work {
                     self.check_status(buf).await;
                 }
 
@@ -641,9 +698,14 @@ where
                 }
 
                 #[cfg(feature = "bluetooth")]
-                if let Some(bt) = &mut self.bt {
-                    bt.handle_irq(&mut self.bus).await;
-                }
+                let bt_work = match &mut self.bt {
+                    Some(bt) => bt.handle_irq(&mut self.bus).await,
+                    None => false,
+                };
+                #[cfg(not(feature = "bluetooth"))]
+                let bt_work = false;
+
+                wifi_work || bt_work
             }
         }
     }
