@@ -37,6 +37,8 @@ const SYSEX_END: u8 = 0xF7;
 const CC_MOD_WHEEL: u8 = 1;
 const CC_PORTAMENTO_TIME: u8 = 5;
 const CC_SUSTAIN: u8 = 64;
+/// Soft pedal (una corda). A full press→release gesture cycles to the next stored preset.
+const CC_SOFT_PEDAL: u8 = 67;
 const CC_FILTER_RESONANCE: u8 = 71;
 const CC_FILTER_CUTOFF: u8 = 74;
 const CC_ALL_SOUND_OFF: u8 = 120;
@@ -60,6 +62,7 @@ struct NoteStack {
     notes: heapless::Vec<u8, 16>,
     pending_off: heapless::Vec<u8, 16>,
     sustain_active: bool,
+    soft_pedal_held: bool,
 }
 
 impl NoteStack {
@@ -68,7 +71,16 @@ impl NoteStack {
             notes: heapless::Vec::new(),
             pending_off: heapless::Vec::new(),
             sustain_active: false,
+            soft_pedal_held: false,
         }
+    }
+
+    /// Update the soft-pedal (CC67) latch and report whether a full press→release gesture
+    /// just completed — the edge used to advance to the next preset.
+    fn soft_pedal(&mut self, pressed: bool) -> bool {
+        let released = self.soft_pedal_held && !pressed;
+        self.soft_pedal_held = pressed;
+        released
     }
 
     fn note_on(&mut self, note: u8) {
@@ -353,6 +365,23 @@ impl FrameProcessor<Mono> for MidiFilterResonance {
     }
 }
 
+/// Load the preset at `index` from flash, map its parameters onto the live controls and
+/// hand it to the DSP via `PRESET_CHANNEL`. Shared by Program Change and the soft-pedal
+/// preset cycling. The caller owns `current_preset_index`.
+async fn load_and_apply_preset(storage: &mut Storage<'static>, index: usize, midi_control: &MidiControl) {
+    if let Some(preset) = storage.load_preset(index).await {
+        log_midi!("Loaded: {}\r\n", preset.get_name());
+        let cutoff_norm = libm::log10f(preset.filter.cutoff / 20.0) / libm::log10f(1000.0);
+        midi_control.set_parameter_1(cutoff_norm.clamp(0.0, 1.0));
+        let res_norm = (preset.filter.resonance - 0.707) / 9.3;
+        midi_control.set_parameter_2(res_norm.clamp(0.0, 1.0));
+        midi_control.set_portamento(preset.portamento);
+        let _ = PRESET_CHANNEL.try_send(preset);
+    } else {
+        log_midi!("Preset {} not found\r\n", index);
+    }
+}
+
 /// Handle a single channel-voice MIDI message. Shared by the USB-MIDI path and the
 /// BLE-MIDI path so both transports drive the synth through identical logic.
 async fn handle_voice_message(
@@ -417,6 +446,20 @@ async fn handle_voice_message(
                         }
                     }
                 }
+                CC_SOFT_PEDAL => {
+                    // A full press (>=64) followed by release (<64) advances to the next
+                    // stored preset, wrapping around. The pedal-up edge is the trigger so a
+                    // single tap = one step, regardless of how long it's held.
+                    if notes.soft_pedal(d2 >= 64) {
+                        let count = storage.num_presets().await;
+                        if count > 0 {
+                            *current_preset_index = (*current_preset_index + 1) % count;
+                            log_midi!("SOFT PEDAL: next preset {}\r\n", *current_preset_index);
+                            defmt::info!("SOFT PEDAL -> preset {=usize}", *current_preset_index);
+                            load_and_apply_preset(storage, *current_preset_index, midi_control).await;
+                        }
+                    }
+                }
                 CC_FILTER_RESONANCE => {
                     log_midi!("RESONANCE: {:.2}", val_norm);
                     defmt::info!("PARAM resonance <- {=f32}", val_norm);
@@ -440,18 +483,7 @@ async fn handle_voice_message(
             log_midi!("PROGRAM CHANGE: {}\r\n", d1);
             defmt::info!("PROGRAM CHANGE -> preset {=u8}", d1);
             *current_preset_index = d1 as usize;
-            if let Some(preset) = storage.load_preset(d1 as usize).await {
-                log_midi!("Loaded: {}\r\n", preset.get_name());
-                let cutoff_norm =
-                    libm::log10f(preset.filter.cutoff / 20.0) / libm::log10f(1000.0);
-                midi_control.set_parameter_1(cutoff_norm.clamp(0.0, 1.0));
-                let res_norm = (preset.filter.resonance - 0.707) / 9.3;
-                midi_control.set_parameter_2(res_norm.clamp(0.0, 1.0));
-                midi_control.set_portamento(preset.portamento);
-                let _ = PRESET_CHANNEL.try_send(preset);
-            } else {
-                log_midi!("Preset {} not found\r\n", d1);
-            }
+            load_and_apply_preset(storage, d1 as usize, midi_control).await;
         }
         PITCH_BEND => {
             let val = ((d2 as u16) << 7) | (d1 as u16);

@@ -99,6 +99,15 @@ impl<'d> Storage<'d> {
         log_storage!("Formatted and wrote defaults.\r\n");
     }
 
+    /// Number of presets currently stored (from the on-flash header). Used to wrap when
+    /// cycling through presets.
+    pub async fn num_presets(&mut self) -> usize {
+        let mut buf = [0u8; 16];
+        self.flash.read(ADDR_OFFSET, &mut buf).await.unwrap();
+        let header: StorageHeader = unsafe { core::ptr::read(buf.as_ptr() as *const _) };
+        header.num_presets as usize
+    }
+
     pub async fn load_preset(&mut self, index: usize) -> Option<Preset> {
         let mut buf = [0u8; 16];
         self.flash.read(ADDR_OFFSET, &mut buf).await.unwrap();
