@@ -130,6 +130,17 @@ SECTIONS {
          * midi_to_freq run per MIDI message (USB and BLE) on core0. (parse_ble_midi is
          * tagged .data.ram_func directly.) */
         *(.text.*rp2350_synth7control4midi*)
+        /* Embassy runtime on the per-poll/per-wake hot path (both cores' executors, the
+         * cyw43 runner's select4 + yield_now every iteration, channel ops, the poll timer,
+         * and the PIO/DMA driving cyw43 SPI + I2S out). All ran from flash -> XIP fetches
+         * contend with the core1 PSRAM delay over the QMI bus. */
+        *(.text.*embassy_futures*)
+        *(.text.*embassy_executor*)
+        *(.text.*embassy_sync*)
+        *(.text.*embassy_time*)
+        *(.text.*embassy_rp3pio*)
+        *(.text.*embassy_rp3dma*)
+        *(.text.*embassy_rp12pio_programs*)
         /* rodata jump tables for the same hot paths (read over XIP during
          * match-arm dispatch); pulled to RAM to remove the last QMI data reads. */
         *(.rodata..Lswitch.table.*cyw43*)
@@ -139,6 +150,11 @@ SECTIONS {
         *(.rodata..Lswitch.table.*trouble_host4host*)
         *(.rodata..Lswitch.table.*trouble_host3att*)
         *(.rodata..Lswitch.table.*trouble_host15channel_manager*)
+        /* Select/Join future poll dispatch tables, read over XIP every poll iteration. */
+        *(.rodata..Lswitch.table.*embassy_futures*)
+        *(.rodata..Lswitch.table.*embassy_executor*)
+        *(.rodata..Lswitch.table.*embassy_sync*)
+        *(.rodata..Lswitch.table.*rp2350_synth7control4midi*)
         . = ALIGN(4);
         __sram_code_end = .;
     } > RAM AT > FLASH
