@@ -101,10 +101,10 @@ headroom). One synth uses ~110 KB heap; core1 drops the old synth before buildin
 - Match surrounding code style. Keep the firmware `no_std`.
 - When verifying changes, prefer flashing and reading the actual logs/audio over assuming.
 
-## Current uncommitted state (as of this writing)
+## Boot diagnostics
 
-`src/main.rs` has the **boot diagnostics removed** (flash-XIP config logging, `psram::bench`,
-the PSRAM-across-flash verify block) for a quieter/faster boot — **intentionally left
-uncommitted**. The protective `psram::self_test` and the functional `speed_up_flash_xip`
-remain. Everything else is committed (fast sine, click mitigations, presets, CC67, tool,
-docs).
+The noisy boot diagnostics have been **removed** (committed): flash-XIP config logging,
+`psram::bench`, and the PSRAM-across-flash verify block, for a quieter/faster boot. The
+protective `psram::self_test` and the functional `speed_up_flash_xip` remain. If you need to
+re-investigate flash/PSRAM timing or corruption, re-add the relevant probe (see
+`docs/psram-flash-corruption-investigation.md`).
