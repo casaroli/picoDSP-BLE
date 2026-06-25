@@ -8,10 +8,10 @@
 
 use bt_hci::controller::ExternalController;
 use bt_hci::param::LeAdvReportsIter;
+use core::sync::atomic::{AtomicBool, Ordering};
 use cyw43::aligned_bytes;
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::{info, warn};
-use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_futures::join::join;
 use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
@@ -64,7 +64,12 @@ async fn led_loop(mut control: cyw43::Control<'static>) {
         if BT_CONNECTED.load(Ordering::Relaxed) {
             // Connected: LED follows played notes. Cap the wait at 1 s so we resume the
             // scanning heartbeat promptly after a disconnect even with no note activity.
-            match select(LED_SIGNAL_CHANNEL.receive(), Timer::after(Duration::from_secs(1))).await {
+            match select(
+                LED_SIGNAL_CHANNEL.receive(),
+                Timer::after(Duration::from_secs(1)),
+            )
+            .await
+            {
                 Either::First(state) => control.gpio_set(0, state).await,
                 Either::Second(_) => {}
             }
@@ -289,7 +294,10 @@ async fn run_gatt<C: Controller>(
         loop {
             match conn.next().await {
                 ConnectionEvent::ConnectionParamsUpdated { conn_interval, .. } => {
-                    info!("[bt] connection interval now {} ms", conn_interval.as_millis());
+                    info!(
+                        "[bt] connection interval now {} ms",
+                        conn_interval.as_millis()
+                    );
                 }
                 ConnectionEvent::RequestConnectionParams(req) => {
                     let p = req.params();

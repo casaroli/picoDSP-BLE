@@ -163,7 +163,9 @@ pub fn speed_up_flash_xip() {
     // Mask interrupts: the embassy time-driver ISR (and any other) is flash-resident
     // and would fault if it fired while a candidate timing is bad. The sweep is a few
     // hundred memory reads per candidate, so the masked window is sub-millisecond.
-    let result = critical_section::with(|_| unsafe { sweep_rxdelay_at_target(flush, golden.as_ptr(), orig.0) });
+    let result = critical_section::with(|_| unsafe {
+        sweep_rxdelay_at_target(flush, golden.as_ptr(), orig.0)
+    });
 
     // Bit i (rxdelay i) set == that sample point read flash correctly at clkdiv=2. A
     // wide run of 1s is a healthy data eye; a single passing bit means the margin is
@@ -181,7 +183,11 @@ pub fn speed_up_flash_xip() {
             let mhz = clocks::clk_sys_freq() / (TARGET_CLKDIV as u32) / 1_000_000;
             info!(
                 "FLASH XIP: clkdiv {}->{} OK ({} MHz), rxdelay {}->{} (centered in passing window)",
-                cur, TARGET_CLKDIV, mhz, orig.rxdelay(), rx,
+                cur,
+                TARGET_CLKDIV,
+                mhz,
+                orig.rxdelay(),
+                rx,
             );
         }
         None => info!(
@@ -207,7 +213,11 @@ pub fn speed_up_flash_xip() {
 /// masked and no other flash/QMI users active.
 #[unsafe(link_section = ".data.ram_func")]
 #[inline(never)]
-unsafe fn sweep_rxdelay_at_target(flush: unsafe extern "C" fn(), golden: *const u32, orig_bits: u32) -> SweepResult {
+unsafe fn sweep_rxdelay_at_target(
+    flush: unsafe extern "C" fn(),
+    golden: *const u32,
+    orig_bits: u32,
+) -> SweepResult {
     let orig = Timing(orig_bits);
     let timing = pac::QMI.mem(0).timing();
     let src = FLASH_BASE as *const u32;
@@ -282,7 +292,10 @@ unsafe fn sweep_rxdelay_at_target(flush: unsafe extern "C" fn(), golden: *const 
         unsafe { flush() };
         cortex_m::asm::dsb();
         cortex_m::asm::isb();
-        return SweepResult { pass_bitmap, chosen: None };
+        return SweepResult {
+            pass_bitmap,
+            chosen: None,
+        };
     }
 
     // Apply the chosen sample point and re-validate before handing control back to
@@ -291,13 +304,19 @@ unsafe fn sweep_rxdelay_at_target(flush: unsafe extern "C" fn(), golden: *const 
     let ok = validate();
     cortex_m::asm::isb();
     if ok {
-        SweepResult { pass_bitmap, chosen: Some(best_center) }
+        SweepResult {
+            pass_bitmap,
+            chosen: Some(best_center),
+        }
     } else {
         timing.write_value(orig);
         cortex_m::asm::dsb();
         unsafe { flush() };
         cortex_m::asm::dsb();
         cortex_m::asm::isb();
-        SweepResult { pass_bitmap, chosen: None }
+        SweepResult {
+            pass_bitmap,
+            chosen: None,
+        }
     }
 }

@@ -213,9 +213,7 @@ pub fn alloc_f32_slice(len: usize) -> &'static mut [f32] {
 /// (a plain incrementing counter would miss many aliasing faults).
 #[inline(always)]
 fn pattern(word_index: usize) -> u32 {
-    (word_index as u32)
-        .wrapping_mul(0x9E37_79B1)
-        ^ 0x1111_1100
+    (word_index as u32).wrapping_mul(0x9E37_79B1) ^ 0x1111_1100
 }
 
 /// Write a pattern across the whole region and read it back twice. Returns the
@@ -243,7 +241,10 @@ pub fn self_test(region: &PsramRegion) -> Result<(), usize> {
         }
     }
 
-    info!("PSRAM self-test PASS — {} MiB verified", region.size() / (1024 * 1024));
+    info!(
+        "PSRAM self-test PASS — {} MiB verified",
+        region.size() / (1024 * 1024)
+    );
     Ok(())
 }
 

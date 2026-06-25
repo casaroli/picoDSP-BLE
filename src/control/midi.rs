@@ -1,18 +1,18 @@
-use crate::common::shared::{BLE_MIDI_CHANNEL, SystemCommand, COMMAND_CHANNEL, PRESET_CHANNEL};
+use crate::common::shared::{BLE_MIDI_CHANNEL, COMMAND_CHANNEL, PRESET_CHANNEL, SystemCommand};
 use crate::data::storage::{
-    Storage, MAGIC as STORAGE_MAGIC, STORAGE_IMAGE_SIZE, VERSION as STORAGE_VERSION,
+    MAGIC as STORAGE_MAGIC, STORAGE_IMAGE_SIZE, Storage, VERSION as STORAGE_VERSION,
 };
 use crate::usb::logger::{LED_SIGNAL_CHANNEL, MIDI_LOG_CHANNEL};
 use alloc::sync::Arc;
 use alloc::vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{Either3, select3};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_time::Instant;
 use embassy_usb::class::midi::{Receiver, Sender};
-use infinitedsp_core::core::channels::Mono;
 use infinitedsp_core::FrameProcessor;
+use infinitedsp_core::core::channels::Mono;
 
 macro_rules! log_midi {
     ($($arg:tt)*) => {
@@ -406,7 +406,11 @@ impl FrameProcessor<Mono> for MidiFilterResonance {
 /// Load the preset at `index` from flash, map its parameters onto the live controls and
 /// hand it to the DSP via `PRESET_CHANNEL`. Shared by Program Change and the soft-pedal
 /// preset cycling. The caller owns `current_preset_index`.
-async fn load_and_apply_preset(storage: &mut Storage<'static>, index: usize, midi_control: &MidiControl) {
+async fn load_and_apply_preset(
+    storage: &mut Storage<'static>,
+    index: usize,
+    midi_control: &MidiControl,
+) {
     if let Some(preset) = storage.load_preset(index).await {
         log_midi!("Loaded: {}\r\n", preset.get_name());
         let cutoff_norm = libm::log10f(preset.filter.cutoff / 20.0) / libm::log10f(1000.0);
@@ -626,7 +630,8 @@ async fn handle_voice_message(
                             *current_preset_index = (*current_preset_index + 1) % count;
                             log_midi!("SOFT PEDAL: next preset {}\r\n", *current_preset_index);
                             defmt::info!("SOFT PEDAL -> preset {=usize}", *current_preset_index);
-                            load_and_apply_preset(storage, *current_preset_index, midi_control).await;
+                            load_and_apply_preset(storage, *current_preset_index, midi_control)
+                                .await;
                         }
                     }
                 }
@@ -787,9 +792,7 @@ pub async fn midi_task(
                                         if sysex_hi >= 0 {
                                             sysex_overflow = true; // dangling nibble
                                         }
-                                        if sysex_hdr[1] == SYSEX_ID
-                                            && sysex_hdr[2] == SYSEX_MODEL
-                                        {
+                                        if sysex_hdr[1] == SYSEX_ID && sysex_hdr[2] == SYSEX_MODEL {
                                             handle_sysex(
                                                 sysex_hdr[3],
                                                 &mut sysex_image,

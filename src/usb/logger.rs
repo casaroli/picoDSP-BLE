@@ -229,4 +229,3 @@ pub async fn logger_task(
         }
     }
 }
-

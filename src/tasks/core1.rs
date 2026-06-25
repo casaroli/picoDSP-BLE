@@ -1,7 +1,7 @@
 use crate::data::presets::Preset;
 use alloc::boxed::Box;
-use core::sync::atomic::Ordering;
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 use embassy_time::Instant;
 use infinitedsp_core::FrameProcessor;
 use infinitedsp_core::core::audio_param::AudioParam;
@@ -136,7 +136,10 @@ pub async fn core1_task(midi_control: Arc<MidiControl>, initial_preset: Preset, 
 
     log_status!("Core 1: Starting...\r\n");
     midi_control.set_portamento(initial_preset.portamento);
-    log_status!("Core 1: Heap free before build: {} KB\r\n", HEAP.free() / 1024);
+    log_status!(
+        "Core 1: Heap free before build: {} KB\r\n",
+        HEAP.free() / 1024
+    );
 
     let mut synth: Option<Box<dyn FrameProcessor<Stereo> + Send>> =
         Some(Box::new(build_synth(midi_control.clone(), initial_preset)));

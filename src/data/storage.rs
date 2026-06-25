@@ -1,4 +1,4 @@
-use crate::data::presets::{get_default_presets, Preset};
+use crate::data::presets::{Preset, get_default_presets};
 use crate::usb::logger::SYSTEM_STATUS_CHANNEL;
 use embassy_rp::flash::{Async, Flash};
 use embassy_rp::peripherals::FLASH;
@@ -29,7 +29,8 @@ const fn sectors_ceil(n: u32) -> u32 {
 /// Size of the full on-flash storage image (header + MAX_PRESETS presets, rounded up to a
 /// whole number of sectors). The SysEx editor transfer is sized to this. 16 + 128*200 =
 /// 25616 -> 28672 (7 sectors). Must equal the editor's `STORAGE_SIZE` in picoDSP-Edit.
-pub const STORAGE_IMAGE_SIZE: usize = sectors_ceil(HEADER_SIZE + (MAX_PRESETS as u32) * 200) as usize;
+pub const STORAGE_IMAGE_SIZE: usize =
+    sectors_ceil(HEADER_SIZE + (MAX_PRESETS as u32) * 200) as usize;
 
 #[repr(C)]
 struct StorageHeader {
