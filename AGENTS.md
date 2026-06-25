@@ -51,14 +51,20 @@ port. Has its own `.cargo/config.toml` (host target). Examples:
   bank = 16 + 128*200 = 25616 B -> spans 7 of the 4 KB sectors); `format`/`write_raw`/`read_raw`
   are multi-sector, `load_preset`/`num_presets` index linearly. Bump `VERSION` to force a
   reformat. Currently `VERSION = 9`, 17 factory presets (`src/data/presets.rs`
-  `get_default_presets`) — can grow toward 128. Note: BLE/USB Program Change is 7-bit, so
-  presets >=128 aren't PC-addressable; and the SysEx full-bank editor transfer
-  (`midi_task`) is still sized for ~20 presets (a 128-bank is ~57 KB nibbleized, which won't
-  fit alongside the ~110 KB synth at the 168 KB heap — would need streaming + a picoDSP-Edit
-  update).
+  `get_default_presets`) — can grow toward 128. The SysEx full-bank editor transfer
+  (`midi_task` `handle_sysex`, talks to picoDSP-Edit) moves the whole 128-capacity image:
+  the incoming WRITE is de-nibbleized on the fly into one `STORAGE_IMAGE_SIZE` (~28 KB)
+  buffer and the DUMP is nibbleized on the fly, so the 2x-larger nibbleized stream never sits
+  in RAM next to the ~110 KB synth. `write_raw` writes **one sector per fully independent
+  gate→erase→write→reinit cycle** (see PSRAM note). Note: BLE/USB Program Change is 7-bit, so
+  presets >=128 aren't PC-addressable. Editor side: `../picoDSP-Edit` `STORAGE_SIZE`/`VERSION`
+  must match this firmware.
 - **PSRAM** (`src/psram.rs`): 8 MiB APS6404L on QMI CS1, backs the delay ring buffers. Shares
   the QMI bus with flash — flash writes need a settle + CS1 reinit + a core1 PSRAM gate
-  (`PSRAM_GATE_REQ/ACK`). See `docs/psram-flash-corruption-investigation.md`.
+  (`PSRAM_GATE_REQ/ACK`). The reinit (`Psram::new`) does its own `multicore::pause_core1`, so
+  a **multi-sector** write must be done as **independent per-sector cycles** (release core1
+  between sectors) with `dsb` barriers, else reinit's pause nests with the gate/embassy flash
+  pauses and FIFO-deadlocks. See `docs/psram-flash-corruption-investigation.md`.
 
 ## Vendored crates (`vendor/`) — patched via `[patch]` in `Cargo.toml`
 

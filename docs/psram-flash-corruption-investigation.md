@@ -66,6 +66,18 @@ re-zero (`SYNTH_RESET_REQ`) — content is preserved now, so there's nothing to 
 
 **Confirmed:** live play + save-preset test reports clean audio.
 
+**Multi-sector writes (added for the 128-preset SysEx editor transfer):** the original
+shipped fix was only ever exercised with a **single 4 KB sector**. A multi-sector write
+(a full 128-preset bank spans 7) deadlocks if done as one gate around all sectors + one
+final reinit: core1 stays in our gate spin across many embassy flash-op `pause_core1`/
+`resume_core1` cycles, and reinit's own `Psram::new` → `pause_core1` then nests into the
+FIFO-pause deadlock this doc warns about. Fix in `write_raw`: do **one sector per fully
+independent cycle** (`lock_core1_off_psram` → erase → write → `after_flash_write` →
+`unlock_core1`), so core1 returns to a known thread-mode state between sectors. Even then it
+was timing-marginal until `dsb` barriers were added around each embassy flash op and a
+`dsb`/`isb` before `Psram::new` — a stray `defmt` log had been masking the ordering bug.
+Verified 5/5 full-bank writebacks, 0 underruns steady-state.
+
 **Caveat — single-core residual:** the boot verification harness in `main.rs`
 (sentinel → flash write → settle+reinit → read) runs *before* core1 spawns, so it
 measures only the inherent recovery-window residual, which still shows ~20 corrupt words
