@@ -8,16 +8,19 @@
 //! `log_flash_xip_config` logs the *live* QMI M0 registers so we can see the actual
 //! divisor and read mode rather than inferring them. Purely observational.
 //!
-//! `speed_up_flash_xip` (phase 1) drops the CS0 clock divisor to 2 (clk_sys/2, the
-//! hardware max) and sweeps RXDELAY to find the read-data sample point that works at
-//! the higher SCK, verifying each candidate against a golden copy of flash before
-//! trusting it. The read *mode* (EBh quad-IO) is left untouched — only the clock and
-//! sample timing change.
+//! `speed_up_flash_xip` (phase 1) drops the CS0 clock divisor to the smallest value
+//! that keeps flash SCK <= `MAX_FLASH_SCK_HZ` at the current clk_sys (`target_clkdiv`,
+//! clamped to the clk_sys/2 hardware max) and sweeps RXDELAY to find the read-data
+//! sample point that works at the higher SCK, verifying each candidate against a golden
+//! copy of flash before trusting it. The read *mode* (EBh quad-IO) is left untouched —
+//! only the clock and sample timing change. The target tracks clk_sys so flash stays
+//! safe when the system is overclocked to push PSRAM (CS1) faster.
 //!
-//! Measured phase-1 result (Pimoroni Pico Plus 2 W, clk_sys 150 MHz): bootrom left CS0
-//! at clkdiv=3 (50 MHz), rxdelay=2. Phase 1 moved it to clkdiv=2 (75 MHz) with a
-//! healthy 3-wide rxdelay eye (pass bits rx1..rx3), centered on rxdelay=2. Stable
-//! end-to-end (PSRAM self-test + benchmarks unaffected).
+//! Measured result (Pimoroni Pico Plus 2 W, clk_sys 200 MHz): bootrom left CS0 at
+//! clkdiv=3, rxdelay=2. Phase 1 moved it to clkdiv=2 (100 MHz) with a healthy 4-wide
+//! rxdelay eye (pass bits rx1..rx4), centered on rxdelay=2. Stable end-to-end (PSRAM
+//! self-test passes; PSRAM SCK is likewise 100 MHz at clkdiv=2). At the older stock
+//! 150 MHz clock the same code resolved to clkdiv=2 = 75 MHz.
 //!
 //! ---------------------------------------------------------------------------------
 //! PHASE 2 (not implemented — continuous-read mode to drop the command prefix)
@@ -69,10 +72,28 @@ const FLASH_BASE: usize = 0x1000_0000;
 const SAMPLE_WORDS: usize = 256;
 /// RXDELAY is a 3-bit field, so the whole space is 0..=7.
 const RXDELAY_MAX: u8 = 7;
-/// Target divisor: clk_sys/2 is the fastest the QMI can drive SCK.
-const TARGET_CLKDIV: u8 = 2;
+/// Hardware floor for the QMI clock divisor — clk_sys/2 is the fastest the QMI can
+/// drive SCK. The flash can never run faster than this regardless of clk_sys.
+const MIN_CLKDIV: u8 = 2;
+/// Conservative ceiling for the flash QSPI SCK. The W25Q-class part on this board is
+/// rated ~133 MHz fast-read, but we keep margin for the EBh quad-IO read eye across
+/// temperature/voltage. CS0 SCK = clk_sys / clkdiv, so the target divisor is the
+/// smallest (>= MIN_CLKDIV) that keeps SCK at or below this. At the stock 150 MHz
+/// clock this still resolves to clkdiv=2 (75 MHz); it only backs off once clk_sys is
+/// raised past 200 MHz, keeping flash safe when the system is overclocked for PSRAM.
+const MAX_FLASH_SCK_HZ: u32 = 100_000_000;
 
-/// Outcome of the RXDELAY sweep at `TARGET_CLKDIV`.
+/// Smallest QMI CS0 divisor that keeps flash SCK <= [`MAX_FLASH_SCK_HZ`] at the
+/// *current* clk_sys, clamped to the hardware minimum. Computed before the SRAM
+/// critical region (a normal flash-resident call) and handed to the sweep.
+fn target_clkdiv() -> u8 {
+    let sys = clocks::clk_sys_freq();
+    // ceil(sys / MAX_FLASH_SCK_HZ) without u32::div_ceil, matching the embassy psram style.
+    let div = (sys + MAX_FLASH_SCK_HZ - 1) / MAX_FLASH_SCK_HZ;
+    div.clamp(MIN_CLKDIV as u32, 255) as u8
+}
+
+/// Outcome of the RXDELAY sweep at the chosen target divisor.
 #[derive(Clone, Copy)]
 struct SweepResult {
     /// Bit `i` set == reads validated at RXDELAY `i` (the data-eye width).
@@ -129,18 +150,24 @@ pub fn log_flash_xip_config() {
     );
 }
 
-/// Phase 1 flash speed-up: set CS0 CLKDIV=2 (clk_sys/2) and pick a working RXDELAY.
+/// Phase 1 flash speed-up: drop CS0 to the fastest safe divisor for the current
+/// clk_sys ([`target_clkdiv`]) and pick a working RXDELAY for it.
+///
+/// The target tracks clk_sys so this stays correct under overclock: at 150 MHz it is
+/// clkdiv=2 (75 MHz); at 264 MHz it backs off to clkdiv=3 (88 MHz) to keep flash under
+/// [`MAX_FLASH_SCK_HZ`] rather than blindly forcing 132 MHz.
 ///
 /// Must be called early in `main` (single core, before core1/PSRAM/DMA/USB are
 /// running) so the only flash traffic is this core's instruction fetch — which the
 /// sweep routine moves into SRAM for the duration. Leaves the divisor at the bootrom
 /// default if no RXDELAY validates at the higher clock, so it can never brick boot.
 pub fn speed_up_flash_xip() {
+    let target = target_clkdiv();
     let orig = pac::QMI.mem(0).timing().read();
     let cur = orig.clkdiv();
     // clkdiv==0 encodes 256; any value already <= target is nothing to do.
-    if cur != 0 && cur <= TARGET_CLKDIV {
-        info!("FLASH XIP: already at clkdiv={}, no speed-up needed", cur);
+    if cur != 0 && cur <= target {
+        info!("FLASH XIP: already at clkdiv={} (<= target {}), no speed-up needed", cur, target);
         return;
     }
 
@@ -164,27 +191,27 @@ pub fn speed_up_flash_xip() {
     // and would fault if it fired while a candidate timing is bad. The sweep is a few
     // hundred memory reads per candidate, so the masked window is sub-millisecond.
     let result = critical_section::with(|_| unsafe {
-        sweep_rxdelay_at_target(flush, golden.as_ptr(), orig.0)
+        sweep_rxdelay_at_target(flush, golden.as_ptr(), orig.0, target)
     });
 
-    // Bit i (rxdelay i) set == that sample point read flash correctly at clkdiv=2. A
-    // wide run of 1s is a healthy data eye; a single passing bit means the margin is
-    // thin and the speed-up should be treated with suspicion (temperature/voltage may
-    // push it out of the window).
+    // Bit i (rxdelay i) set == that sample point read flash correctly at the target
+    // divisor. A wide run of 1s is a healthy data eye; a single passing bit means the
+    // margin is thin and the speed-up should be treated with suspicion (temperature/
+    // voltage may push it out of the window).
     info!(
         "FLASH XIP rxdelay sweep @clkdiv={}: pass[rx7..rx0]={=u8:08b} ({} of 8 ok, 1=read OK)",
-        TARGET_CLKDIV,
+        target,
         result.pass_bitmap,
         result.pass_bitmap.count_ones(),
     );
 
     match result.chosen {
         Some(rx) => {
-            let mhz = clocks::clk_sys_freq() / (TARGET_CLKDIV as u32) / 1_000_000;
+            let mhz = clocks::clk_sys_freq() / (target as u32) / 1_000_000;
             info!(
                 "FLASH XIP: clkdiv {}->{} OK ({} MHz), rxdelay {}->{} (centered in passing window)",
                 cur,
-                TARGET_CLKDIV,
+                target,
                 mhz,
                 orig.rxdelay(),
                 rx,
@@ -192,12 +219,12 @@ pub fn speed_up_flash_xip() {
         }
         None => info!(
             "FLASH XIP: clkdiv={} unstable for all rxdelay; kept bootrom clkdiv={}",
-            TARGET_CLKDIV, cur,
+            target, cur,
         ),
     }
 }
 
-/// SRAM-resident RXDELAY sweep at `TARGET_CLKDIV`. Copied to RAM before `main` via
+/// SRAM-resident RXDELAY sweep at `target_clkdiv`. Copied to RAM before `main` via
 /// `.data.ram_func` (same mechanism as `PsramDelay::process`), so it executes with no
 /// instruction fetch from flash — essential, because mid-sweep the flash timing is
 /// deliberately set to candidates that may not read correctly.
@@ -217,6 +244,7 @@ unsafe fn sweep_rxdelay_at_target(
     flush: unsafe extern "C" fn(),
     golden: *const u32,
     orig_bits: u32,
+    target_clkdiv: u8,
 ) -> SweepResult {
     let orig = Timing(orig_bits);
     let timing = pac::QMI.mem(0).timing();
@@ -226,7 +254,7 @@ unsafe fn sweep_rxdelay_at_target(
     // max_select, select_hold, pagebreak, cooldown, ...) is preserved.
     let apply = |rxdelay: u8| {
         let mut t = orig;
-        t.set_clkdiv(TARGET_CLKDIV);
+        t.set_clkdiv(target_clkdiv);
         t.set_rxdelay(rxdelay);
         timing.write_value(t);
         cortex_m::asm::dsb();

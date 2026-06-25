@@ -91,7 +91,28 @@ async fn main(spawner: Spawner) {
     init_heap();
     // Relocate cyw43 code into SRAM before anything touches the radio.
     init_ram_code();
-    let p = embassy_rp::init(Default::default());
+
+    // Overclock clk_sys 150 -> 200 MHz so the QMI can drive PSRAM (CS1) faster: the
+    // embassy psram driver divides clk_sys by an integer to stay <= the APS6404L's
+    // 133 MHz, so 150 MHz floors at divisor 2 = 75 MHz, while 200 MHz gives divisor 2
+    // = 100 MHz (still in-spec for the part). 200 MHz needs V1_15 (V1_10 is only rated
+    // to ~150 MHz). Flash (CS0) also rides clk_sys but `speed_up_flash_xip` retunes it
+    // adaptively below. 12 MHz xosc * 100 / (6 * 1) = 200 MHz (VCO 1200 MHz, in range).
+    let clocks = {
+        use embassy_rp::clocks::{ClockConfig, CoreVoltage, PllConfig};
+        let mut c = ClockConfig::crystal(12_000_000);
+        if let Some(xosc) = &mut c.xosc {
+            xosc.sys_pll = Some(PllConfig {
+                refdiv: 1,
+                fbdiv: 100,
+                post_div1: 6,
+                post_div2: 1,
+            });
+        }
+        c.core_voltage = CoreVoltage::V1_15;
+        c
+    };
+    let p = embassy_rp::init(embassy_rp::config::Config::new(clocks));
 
     // Give the DMA masters high priority on the bus fabric so the core1 DSP's heavy SRAM
     // traffic can't starve the audio output DMA (which would underflow the I2S PIO FIFO and

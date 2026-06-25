@@ -53,6 +53,21 @@ impl PsramRegion {
 ///
 /// Panics if the APS6404L is not detected — on this board PSRAM is expected, so a
 /// missing/failed part is fatal (matches the reference driver's behaviour).
+/// APS6404L maximum memory operating frequency (matches `Config::aps6404l`'s
+/// `max_mem_freq`). The QMI SCK is clk_sys divided down to stay at or below this.
+const APS6404L_MAX_MEM_HZ: u32 = 133_000_000;
+
+/// QMI CS1 clock divisor the embassy psram driver derives for a given clk_sys —
+/// `ceil(clk_sys / 133 MHz)`, floored at 2 above 100 MHz clk_sys (see embassy-rp
+/// `psram.rs`). Mirrored here only so the boot log can report the real SCK.
+fn psram_divisor(clk_sys_hz: u32) -> u32 {
+    let mut divisor = (clk_sys_hz + APS6404L_MAX_MEM_HZ - 1) / APS6404L_MAX_MEM_HZ;
+    if divisor == 1 && clk_sys_hz > 100_000_000 {
+        divisor = 2;
+    }
+    divisor
+}
+
 /// PSRAM controller config shared by init and reinit.
 fn psram_config() -> Config {
     let mut config = Config::aps6404l();
@@ -75,11 +90,20 @@ pub fn init(qmi_cs1: Peri<'static, QMI_CS1>, cs1_pin: Peri<'static, PIN_47>) -> 
                 base: psram.base_address() as usize,
                 size: psram.size(),
             };
+            // Report the *actual* QMI CS1 SCK, not just clk_sys — the bus runs at
+            // clk_sys / divisor, where the driver picks divisor = ceil(clk_sys / 133 MHz)
+            // (forced to >=2 above 100 MHz clk_sys). This is what answers "is PSRAM at
+            // full speed": 200 MHz clk_sys -> divisor 2 -> 100 MHz SCK.
+            let sys_hz = clocks::clk_sys_freq();
+            let divisor = psram_divisor(sys_hz);
             info!(
-                "PSRAM: APS6404L OK — {} MiB @ {=usize:#x}, sys_clk {} MHz",
+                "PSRAM: APS6404L OK — {} MiB @ {=usize:#x}, clk_sys {} MHz / div {} = SCK {} MHz (max {} MHz)",
                 region.size / (1024 * 1024),
                 region.base,
-                clocks::clk_sys_freq() / 1_000_000,
+                sys_hz / 1_000_000,
+                divisor,
+                sys_hz / divisor / 1_000_000,
+                APS6404L_MAX_MEM_HZ / 1_000_000,
             );
             region
         }
