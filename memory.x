@@ -141,6 +141,11 @@ SECTIONS {
         *(.text.*embassy_rp3pio*)
         *(.text.*embassy_rp3dma*)
         *(.text.*embassy_rp12pio_programs*)
+        /* USB device stack + MIDI/UAC1 audio/serial classes + our usb module: endpoint
+         * IN/OUT transfers run per packet (audio stream, USB-MIDI, serial logging) on core0.
+         * (*embassy_usb* also catches embassy_usb_logger.) */
+        *(.text.*embassy_usb*)
+        *(.text.*rp2350_synth3usb*)
         /* rodata jump tables for the same hot paths (read over XIP during
          * match-arm dispatch); pulled to RAM to remove the last QMI data reads. */
         *(.rodata..Lswitch.table.*cyw43*)
@@ -154,6 +159,7 @@ SECTIONS {
         *(.rodata..Lswitch.table.*embassy_futures*)
         *(.rodata..Lswitch.table.*embassy_executor*)
         *(.rodata..Lswitch.table.*embassy_sync*)
+        *(.rodata..Lswitch.table.*embassy_usb*)
         *(.rodata..Lswitch.table.*rp2350_synth7control4midi*)
         . = ALIGN(4);
         __sram_code_end = .;
