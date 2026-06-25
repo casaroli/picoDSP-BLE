@@ -1,6 +1,6 @@
 use crate::data::presets::{get_default_presets, Preset};
 use crate::usb::logger::SYSTEM_STATUS_CHANNEL;
-use embassy_rp::flash::{Async, Flash, ERASE_SIZE};
+use embassy_rp::flash::{Async, Flash};
 use embassy_rp::peripherals::FLASH;
 use embedded_storage_async::nor_flash::NorFlash;
 
@@ -8,12 +8,23 @@ use embedded_storage_async::nor_flash::NorFlash;
 pub const MAGIC: u32 = 0x50445350;
 // Bump on any change to the default preset bank or the on-flash layout so existing
 // devices re-format and preload the new defaults on next boot.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 const FLASH_SIZE: u32 = 2 * 1024 * 1024;
 const STORAGE_SIZE: u32 = 64 * 1024;
 const ADDR_OFFSET: u32 = FLASH_SIZE - STORAGE_SIZE;
 const SECTOR_SIZE: u32 = 4096;
+const HEADER_SIZE: u32 = 16;
+
+/// Maximum presets the storage can hold. A 128-preset bank spans several 4 KB flash sectors
+/// (16 + 128*200 = 25616 B -> 7 sectors), well within the 64 KB reserved region. Note: BLE/USB
+/// Program Change is 7-bit, so presets >= 128 wouldn't be PC-addressable anyway.
+pub const MAX_PRESETS: usize = 128;
+
+/// Round `n` up to a whole number of flash sectors (= erase granularity).
+const fn sectors_ceil(n: u32) -> u32 {
+    n.div_ceil(SECTOR_SIZE) * SECTOR_SIZE
+}
 
 #[repr(C)]
 struct StorageHeader {
@@ -66,39 +77,40 @@ impl<'d> Storage<'d> {
         // Park core1 off PSRAM for the whole flash write + reconfigure.
         crate::psram::lock_core1_off_psram().await;
 
+        let defaults = get_default_presets();
+        let num_presets = defaults.len();
+        let preset_size = core::mem::size_of::<Preset>();
+        debug_assert!(num_presets <= MAX_PRESETS);
+
+        // Build the whole header+presets image (rounded up to a sector multiple, zero-padded)
+        // on the heap — format() runs single-core at boot before the synth allocates, so the
+        // heap is free. This spans as many 4 KB sectors as the bank needs.
+        let used = HEADER_SIZE as usize + num_presets * preset_size;
+        let image_len = sectors_ceil(used as u32) as usize;
+
         self.flash
-            .erase(ADDR_OFFSET, ADDR_OFFSET + ERASE_SIZE as u32)
+            .erase(ADDR_OFFSET, ADDR_OFFSET + image_len as u32)
             .await
             .unwrap();
-
-        let defaults = get_default_presets();
-        let num_presets = defaults.len() as u32;
 
         let header = StorageHeader {
             magic: MAGIC,
             version: VERSION,
-            num_presets,
+            num_presets: num_presets as u32,
             padding: 0,
         };
-
-        let mut sector_buf = [0u8; 4096];
-
+        let mut image = alloc::vec![0u8; image_len];
         let header_bytes: [u8; 16] = unsafe { core::mem::transmute(header) };
-        sector_buf[0..16].copy_from_slice(&header_bytes);
+        image[0..16].copy_from_slice(&header_bytes);
+        let presets_bytes = unsafe {
+            core::slice::from_raw_parts(defaults.as_ptr() as *const u8, num_presets * preset_size)
+        };
+        image[16..16 + presets_bytes.len()].copy_from_slice(presets_bytes);
 
-        let mut current_pos = 16;
-        for preset in defaults.iter() {
-            let size = core::mem::size_of::<Preset>();
-            let bytes =
-                unsafe { core::slice::from_raw_parts(preset as *const _ as *const u8, size) };
-            sector_buf[current_pos..current_pos + size].copy_from_slice(bytes);
-            current_pos += size;
-        }
-
-        self.flash.write(ADDR_OFFSET, &sector_buf).await.unwrap();
+        self.flash.write(ADDR_OFFSET, &image).await.unwrap();
         crate::psram::after_flash_write();
         crate::psram::unlock_core1();
-        log_storage!("Formatted and wrote defaults.\r\n");
+        log_storage!("Formatted: wrote {} presets.\r\n", num_presets);
     }
 
     /// Number of presets currently stored (from the on-flash header). Used to wrap when
@@ -145,7 +157,7 @@ impl<'d> Storage<'d> {
     }
 
     pub async fn read_raw(&mut self, buf: &mut [u8]) {
-        let len = buf.len().min(SECTOR_SIZE as usize);
+        let len = buf.len().min(STORAGE_SIZE as usize);
         self.flash.read(ADDR_OFFSET, &mut buf[..len]).await.unwrap();
     }
 
@@ -154,14 +166,16 @@ impl<'d> Storage<'d> {
         // shares the QMI bus with flash), then release once PSRAM is reconfigured.
         crate::psram::lock_core1_off_psram().await;
 
-        log_storage!("SysEx Write: Erasing sector...\r\n");
+        // Erase as many whole sectors as `data` spans (a full 128-preset bank is 7 sectors),
+        // capped at the reserved region. `data` is expected to be a sector-multiple image.
+        let erase_len = sectors_ceil(data.len() as u32).min(STORAGE_SIZE);
+        log_storage!("SysEx Write: Erasing {} bytes...\r\n", erase_len);
         self.flash
-            .erase(ADDR_OFFSET, ADDR_OFFSET + ERASE_SIZE as u32)
+            .erase(ADDR_OFFSET, ADDR_OFFSET + erase_len)
             .await
             .unwrap();
 
         log_storage!("SysEx Write: Writing {} bytes...\r\n", data.len());
-
         self.flash.write(ADDR_OFFSET, data).await.unwrap();
 
         crate::psram::after_flash_write();

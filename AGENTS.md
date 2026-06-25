@@ -46,10 +46,16 @@ port. Has its own `.cargo/config.toml` (host target). Examples:
   TrouBLE host as a **Central** that scans for, pairs with (LE Legacy JustWorks + bonding),
   and subscribes to a BLE-MIDI keyboard; decodes BLE-MIDI notifications into
   `BLE_MIDI_CHANNEL`. Requests a 15–30 ms connection interval (keyboard pulls to ~7.5 ms).
-- **Storage** (`src/data/storage.rs`): one 4 KB flash sector at top of flash. Header
-  (magic/version/count) + N x 200-byte `Preset`. **Max 20 presets** fit the sector
-  (`16 + N*200 <= 4096`). Bump `VERSION` to force a reformat with new defaults. Currently
-  `VERSION = 8`, 17 presets (`src/data/presets.rs` `get_default_presets`).
+- **Storage** (`src/data/storage.rs`): header (magic/version/count) + N x 200-byte `Preset`
+  in a 64 KB reserved flash region at top of flash. **Capacity `MAX_PRESETS = 128`** (a 128
+  bank = 16 + 128*200 = 25616 B -> spans 7 of the 4 KB sectors); `format`/`write_raw`/`read_raw`
+  are multi-sector, `load_preset`/`num_presets` index linearly. Bump `VERSION` to force a
+  reformat. Currently `VERSION = 9`, 17 factory presets (`src/data/presets.rs`
+  `get_default_presets`) — can grow toward 128. Note: BLE/USB Program Change is 7-bit, so
+  presets >=128 aren't PC-addressable; and the SysEx full-bank editor transfer
+  (`midi_task`) is still sized for ~20 presets (a 128-bank is ~57 KB nibbleized, which won't
+  fit alongside the ~110 KB synth at the 168 KB heap — would need streaming + a picoDSP-Edit
+  update).
 - **PSRAM** (`src/psram.rs`): 8 MiB APS6404L on QMI CS1, backs the delay ring buffers. Shares
   the QMI bus with flash — flash writes need a settle + CS1 reinit + a core1 PSRAM gate
   (`PSRAM_GATE_REQ/ACK`). See `docs/psram-flash-corruption-investigation.md`.
