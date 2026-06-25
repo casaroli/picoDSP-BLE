@@ -70,11 +70,22 @@ Do not assume upstream behaviour; these are **locally patched**. If you bump a r
   (~1100 cycles on RP2350; ~90 % of a block!) replaced with a **fast polynomial**
   (`fast_sin_norm`, ~16 % cost). Without it, sine-based presets underflow into silence+noise.
 
-## Known issues / open work
+## Hot code relocated to SRAM (`memory.x` `.ram_code` + `.data.ram_func`)
 
-- **BLE-radio audio clicks under load** (open): dense CC streams still click. Root cause and
-  the reverted interrupt-executor attempt are written up in
-  **`docs/audio-clicks-ble-contention.md`** — read it before touching the audio path.
+To keep instruction fetch off the QMI/XIP bus that the core1 PSRAM delay shares (the cause
+of audio clicks), the **hot paths are copied to RAM at boot** (`init_ram_code`):
+`cyw43`, `infinitedsp_core` (DSP), `libm`, **`bt_hci` + the hot `trouble_host` modules**
+(host/att/channel_manager/connection_manager/etc. — but NOT the cold `security_manager`),
+and this crate's **`control::midi`** module + `parse_ble_midi`/`adv_contains_uuid`. Adding a
+new hot path? Add its symbol pattern to `.ram_code` (or tag a fn `.data.ram_func`) and watch
+the RAM budget. Heap is **208 KB** (trimmed from 256 to pay for the relocation; ~91 KB stack
+headroom). One synth uses ~110 KB heap; core1 drops the old synth before building the new.
+
+## Known issues
+
+- **BLE-radio audio clicks**: RESOLVED — see `docs/audio-clicks-ble-contention.md` (DMA bus
+  priority + lighter cyw43 poll + running the BLE/MIDI hot path from SRAM). Read it before
+  touching the audio path or the relocation.
 - **PSRAM-across-flash corruption**: largely worked around; details in
   `docs/psram-flash-corruption-investigation.md`.
 

@@ -33,33 +33,43 @@ Two distinct contention mechanisms:
    traffic delay the I2S output DMA (DMA_CH1) enough to underflow the ~8-sample PIO FIFO
    (~166 µs of slack). *Mitigated* (see below).
 
-2. **I2S re-queue wake latency (the remaining issue).** The double-buffer is re-queued by
-   `main_task` on core0's **thread executor**. The re-queue deadline after a buffer
-   completes is only the PIO FIFO drain (~166 µs). When a BLE traffic burst (CC flood,
-   notifications) keeps core0 busy — cyw43 SPI reads + trouble-host GATT + `midi_task` +
-   `log_midi!` — `main_task` wakes too late and the FIFO underflows. This is why it scales
-   with radio traffic and is worst on dense CC.
+2. **XIP instruction-fetch contention (the dominant remaining mechanism).** The BLE host
+   stack (TrouBLE Runner + bt-hci) and the MIDI handlers ran from **flash (XIP)**. cyw43 and
+   the DSP were already relocated to RAM, but this code was not. While the radio is on, that
+   code executes constantly — processing advertising reports **even when only scanning, not
+   connected** (matches "BT on, not connected -> clicks"), and notifications/CC when
+   connected. Its **instruction fetches go over the QMI bus**, which the core1 PSRAM delay
+   shares -> the DSP stalls -> the audio output glitches. This scales with radio traffic
+   (worst on a dense CC stream) and is independent of whether a note is playing.
 
-## What was fixed (committed)
+## What fixed it
 
-`fix(audio): cut BLE-radio audio clicks via DMA bus priority + lighter poll`:
+Three changes, all committed:
 
-- **`BUSCTRL.bus_priority` DMA_R/DMA_W = high** — DMA masters outrank the cores on the bus
-  fabric so core1 can't starve the audio DMA.
-- **I2S DMA channel `HIGH_PRIORITY`** (re-asserted each block in `main_task`, since embassy
-  rewrites `ctrl_trig` on every `write()`) — I2S outranks cyw43's DMA in the DMA scheduler.
-  → **Idle / connection-event clicks: gone.**
-- **cyw43 adaptive-poll budget 64 -> 8** (`vendor/cyw43/src/runner.rs`) — steady-state play
-  drops back to the gentle 8 ms idle poll between notes instead of polling at 250 µs
-  continuously, cutting the bus flooding. Init stays fast (continuous activity keeps the
-  budget refreshed). → **During-play clicks: largely gone.**
+1. **`BUSCTRL.bus_priority` DMA_R/DMA_W = high** + **I2S DMA channel `HIGH_PRIORITY`**
+   (re-asserted each block in `main_task`, since embassy rewrites `ctrl_trig` every
+   `write()`) — DMA outranks the cores on the bus fabric and the I2S DMA outranks cyw43's
+   DMA in the scheduler. → idle / connection-event clicks gone.
+   (`fix(audio): cut BLE-radio audio clicks via DMA bus priority + lighter poll`)
+2. **cyw43 adaptive-poll budget 64 -> 8** (`vendor/cyw43/src/runner.rs`) — steady-state play
+   drops to the gentle 8 ms idle poll between notes instead of polling at 250 µs
+   continuously. → most during-play clicks gone. (same commit)
+3. **Run the BLE-host + MIDI hot path from SRAM** (`memory.x` `.ram_code` + `.data.ram_func`)
+   — the real fix for the residual clicks. Relocated `bt_hci` and the hot `trouble_host`
+   modules (`host`/`att`/`channel_manager`/`connection_manager`/`packet_pool`/`central`/
+   `connection`/`gatt`/`l2cap`/`pdu`/`codec`/`cursor`/`scan`), this crate's `control::midi`
+   module, and `parse_ble_midi`/`adv_contains_uuid`. **Deliberately skipped
+   `trouble_host::security_manager` (~53 KB, only runs once per pairing — cold)** to stay in
+   the RAM budget. Paid for it by trimming the heap **256 KB -> 208 KB** (safe: core1 drops
+   the old synth before building the new, so peak heap is ~110 KB; ~91 KB stack headroom).
+   → **clicks gone, including the scanning/CC-flood case** (confirmed on hardware).
 
-## What's still open
+## Status: RESOLVED.
 
-**Dense CC streams still click** (mechanism #2 above — core0 thread-executor wake latency
-under BLE flood). Not yet fixed.
+## Appendix — attempted fix that did NOT work: audio on an interrupt executor
 
-## Attempted fix that did NOT work: audio on an interrupt executor
+(Pursued before #3 was found, when the cause was mis-attributed to I2S re-queue wake
+latency on the thread executor. The actual cause was XIP contention, fixed by #3.)
 
 The intended proper fix for #2: run the I2S output loop on a **high-priority interrupt
 executor** (a spare `SWI_IRQ`) so it preempts the cyw43/BLE/MIDI work on core0's thread
