@@ -1,8 +1,9 @@
 # rp2350-synth
 
-A polyphonic-voiced (mono-priority) **synthesizer firmware** for the **RP2350**, written in
-`no_std` Rust on top of [Embassy](https://embassy.dev). It runs across both cores: one core
-drives USB and audio I/O, the other runs the DSP engine.
+A polyphonic-voiced (mono-priority) **synthesizer firmware** for the **RP2350**
+(specifically the [Pimoroni Pico Plus 2 W](https://shop.pimoroni.com/products/pimoroni-pico-plus-2-w)),
+written in `no_std` Rust on top of [Embassy](https://embassy.dev). It runs across both cores: one
+core drives USB and audio I/O, the other runs the DSP engine.
 
 It plays from **USB-MIDI** and **BLE-MIDI** (it acts as a Bluetooth Central and connects to a
 BLE-MIDI keyboard), outputs audio over **I2S** at 48 kHz / 16-bit, and ships with **17 factory
