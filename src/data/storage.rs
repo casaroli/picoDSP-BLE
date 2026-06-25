@@ -8,7 +8,7 @@ use embedded_storage_async::nor_flash::NorFlash;
 pub const MAGIC: u32 = 0x50445350;
 // Bump on any change to the default preset bank or the on-flash layout so existing
 // devices re-format and preload the new defaults on next boot.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 11;
 
 const FLASH_SIZE: u32 = 2 * 1024 * 1024;
 const STORAGE_SIZE: u32 = 64 * 1024;
@@ -59,28 +59,30 @@ impl<'d> Storage<'d> {
         Self { flash }
     }
 
-    pub async fn init(&mut self) {
+    /// Read the on-flash header and report whether a (re)format is needed (missing magic or a
+    /// version bump). Does NOT write — the actual `format()` is deferred until core1 is running
+    /// (see the boot-ordering note on `format`). A single flash read is safe pre-core1.
+    pub async fn needs_format(&mut self) -> bool {
         let mut buf = [0u8; 16];
         self.flash.read(ADDR_OFFSET, &mut buf).await.unwrap();
-
         let header: StorageHeader = unsafe { core::ptr::read(buf.as_ptr() as *const _) };
-
-        if header.magic != MAGIC || header.version != VERSION {
-            log_storage!("Storage init/version mismatch. Formatting...\r\n");
-            self.format().await;
+        let stale = header.magic != MAGIC || header.version != VERSION;
+        if stale {
+            log_storage!("Storage version mismatch — reformat pending.\r\n");
         } else {
-            log_storage!(
-                "Storage initialized. Found {} presets.\r\n",
-                header.num_presets
-            );
+            log_storage!("Storage OK. Found {} presets.\r\n", header.num_presets);
         }
+        stale
     }
 
+    /// Rewrite the whole factory bank. MUST be called with core1 spawned and the audio drain
+    /// loop running (i.e. from `midi_task`, like the runtime ResetStorage command), NOT bare at
+    /// boot. The 128-preset bank spans 7 flash sectors; every embassy flash op pauses core1 over
+    /// the SIO FIFO. Before core1 is launched that pause is "answered" only by the bootrom's FIFO
+    /// echo, which desyncs after a handful of ops and hangs mid-format. With core1 running,
+    /// `write_raw`'s per-sector gate→erase→write→reinit cycle is the proven, deadlock-safe path.
     pub async fn format(&mut self) {
         log_storage!("Formatting storage area...\r\n");
-
-        // Park core1 off PSRAM for the whole flash write + reconfigure.
-        crate::psram::lock_core1_off_psram().await;
 
         let defaults = get_default_presets();
         let num_presets = defaults.len();
@@ -88,15 +90,9 @@ impl<'d> Storage<'d> {
         debug_assert!(num_presets <= MAX_PRESETS);
 
         // Build the whole header+presets image (rounded up to a sector multiple, zero-padded)
-        // on the heap — format() runs single-core at boot before the synth allocates, so the
-        // heap is free. This spans as many 4 KB sectors as the bank needs.
+        // on the heap. This spans as many 4 KB sectors as the bank needs.
         let used = HEADER_SIZE as usize + num_presets * preset_size;
         let image_len = sectors_ceil(used as u32) as usize;
-
-        self.flash
-            .erase(ADDR_OFFSET, ADDR_OFFSET + image_len as u32)
-            .await
-            .unwrap();
 
         let header = StorageHeader {
             magic: MAGIC,
@@ -112,9 +108,8 @@ impl<'d> Storage<'d> {
         };
         image[16..16 + presets_bytes.len()].copy_from_slice(presets_bytes);
 
-        self.flash.write(ADDR_OFFSET, &image).await.unwrap();
-        crate::psram::after_flash_write();
-        crate::psram::unlock_core1();
+        self.write_raw(&image).await;
+
         log_storage!("Formatted: wrote {} presets.\r\n", num_presets);
     }
 
@@ -179,7 +174,7 @@ impl<'d> Storage<'d> {
         // sector reuses the exact single-sector path that's been verified safe.
         let total = sectors_ceil(data.len() as u32).min(STORAGE_SIZE);
         log_storage!(
-            "SysEx Write: {} bytes -> {} sectors\r\n",
+            "Flash write: {} bytes -> {} sectors\r\n",
             data.len(),
             total / SECTOR_SIZE
         );
@@ -212,6 +207,6 @@ impl<'d> Storage<'d> {
             off += SECTOR_SIZE;
         }
 
-        log_storage!("SysEx Write: Done.\r\n");
+        log_storage!("Flash write: Done.\r\n");
     }
 }

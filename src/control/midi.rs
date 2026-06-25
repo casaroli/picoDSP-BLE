@@ -136,6 +136,7 @@ pub struct MidiControl {
     portamento_amount_bits: AtomicU32,
     pitch_bend_bits: AtomicU32,
     mod_wheel_bits: AtomicU32,
+    velocity_bits: AtomicU32,
     parameter_1_bits: AtomicU32,
     parameter_2_bits: AtomicU32,
 }
@@ -149,6 +150,7 @@ impl MidiControl {
             portamento_amount_bits: AtomicU32::new(0.0f32.to_bits()),
             pitch_bend_bits: AtomicU32::new(1.0f32.to_bits()),
             mod_wheel_bits: AtomicU32::new(0.0f32.to_bits()),
+            velocity_bits: AtomicU32::new(1.0f32.to_bits()),
             parameter_1_bits: AtomicU32::new(0.5f32.to_bits()),
             parameter_2_bits: AtomicU32::new(0.0f32.to_bits()),
         }
@@ -185,6 +187,12 @@ impl MidiControl {
             .store(value.to_bits(), Ordering::Relaxed);
     }
 
+    /// Latch the normalized (0..1) velocity of the most recent note-on. Held until the next
+    /// note-on, so legato fall-back notes keep the current velocity.
+    pub fn set_velocity(&self, value: f32) {
+        self.velocity_bits.store(value.to_bits(), Ordering::Relaxed);
+    }
+
     pub fn set_parameter_1(&self, value: f32) {
         self.parameter_1_bits
             .store(value.to_bits(), Ordering::Relaxed);
@@ -219,6 +227,10 @@ impl MidiControl {
     #[allow(dead_code)]
     pub fn get_mod_wheel(&self) -> f32 {
         f32::from_bits(self.mod_wheel_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn get_velocity(&self) -> f32 {
+        f32::from_bits(self.velocity_bits.load(Ordering::Relaxed))
     }
 
     pub fn get_parameter_1(&self) -> f32 {
@@ -320,6 +332,29 @@ impl FrameProcessor<Mono> for MidiGate {
     }
     fn visualize(&self, _indent: usize) -> alloc::string::String {
         "MidiGate".into()
+    }
+}
+
+/// Emits the latched note-on velocity (0..1) as a control signal. Multiplied into the amp
+/// envelope so harder hits are louder — fixed, always-on velocity sensitivity.
+pub struct MidiVelocity(pub Arc<MidiControl>);
+impl FrameProcessor<Mono> for MidiVelocity {
+    fn process(&mut self, buffer: &mut [f32], _frame_index: u64) {
+        let v = self.0.get_velocity();
+        for sample in buffer.iter_mut() {
+            *sample = v;
+        }
+    }
+    fn set_sample_rate(&mut self, _sample_rate: f32) {}
+    fn reset(&mut self) {}
+    fn latency_samples(&self) -> u32 {
+        0
+    }
+    fn name(&self) -> &str {
+        "MidiVelocity"
+    }
+    fn visualize(&self, _indent: usize) -> alloc::string::String {
+        "MidiVelocity".into()
     }
 }
 
@@ -536,6 +571,7 @@ async fn handle_voice_message(
             let freq = midi_to_freq(d1);
             log_midi!("NOTE ON: {} ({} Hz)", d1, freq);
             notes.note_on(d1);
+            midi_control.set_velocity((d2 as f32 / 127.0).clamp(0.0, 1.0));
             midi_control.set_freq(freq);
             midi_control.set_gate(true);
             let _ = LED_SIGNAL_CHANNEL.try_send(true);
@@ -636,7 +672,23 @@ pub async fn midi_task(
     mut sender: Sender<'static, Driver<'static, USB>>,
     midi_control: Arc<MidiControl>,
     mut storage: Storage<'static>,
+    needs_format: bool,
 ) {
+    // Deferred boot reformat. main() decided a reformat is due (version bump / blank flash) but
+    // left the 7-sector bank write to here: format() drives embassy flash ops that pause core1
+    // over the SIO FIFO, and that only works once core1 is actually running its loop (so it can
+    // ack the PSRAM gate) AND the audio drain loop in main_task is live (so core1 doesn't block
+    // in AUDIO_CHANNEL.send and miss the gate). Wait for core1, then format — identical to the
+    // runtime ResetStorage path, which is the proven, deadlock-safe scenario.
+    if needs_format {
+        while !crate::common::shared::CORE1_RUNNING.load(core::sync::atomic::Ordering::Acquire) {
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(2)).await;
+        }
+        log_midi!("Boot: writing 128-preset factory bank...\r\n");
+        storage.format().await;
+        log_midi!("Boot: factory bank written.\r\n");
+    }
+
     let mut buf = [0; 64];
     let mut notes = NoteStack::new();
 

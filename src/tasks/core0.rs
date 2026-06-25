@@ -22,6 +22,7 @@ pub async fn main_task(
     mut i2s: PioI2sOut<'_, PIO0, 0>,
     midi_control: Arc<MidiControl>,
     storage: Storage<'static>,
+    needs_format: bool,
 ) {
     let usb_device = {
         let driver = Driver::new(usb, crate::Irqs);
@@ -43,6 +44,7 @@ pub async fn main_task(
                 device.midi_sender,
                 midi_control,
                 storage,
+                needs_format,
             )
             .unwrap(),
         );

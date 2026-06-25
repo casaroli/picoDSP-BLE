@@ -7,7 +7,7 @@ Guide for agents working on this repo. Read this first.
 A polyphonic-voiced (mono-priority) **synthesizer firmware** for the **RP2350**
 (Raspberry Pi Pico Plus 2 W). `no_std` Rust, **Embassy** async, dual-core. It plays from
 **USB-MIDI** and **BLE-MIDI** (a Bluetooth keyboard), outputs audio over **I2S**, and stores
-**17 factory presets** in flash.
+a full **128-preset factory showcase bank** in flash.
 
 ## Build / flash / run
 
@@ -50,8 +50,8 @@ port. Has its own `.cargo/config.toml` (host target). Examples:
   in a 64 KB reserved flash region at top of flash. **Capacity `MAX_PRESETS = 128`** (a 128
   bank = 16 + 128*200 = 25616 B -> spans 7 of the 4 KB sectors); `format`/`write_raw`/`read_raw`
   are multi-sector, `load_preset`/`num_presets` index linearly. Bump `VERSION` to force a
-  reformat. Currently `VERSION = 9`, 17 factory presets (`src/data/presets.rs`
-  `get_default_presets`) — can grow toward 128. The SysEx full-bank editor transfer
+  reformat. Currently `VERSION = 11`, a full **128 factory presets** (`src/data/presets.rs`
+  `get_default_presets`, grouped by category). The SysEx full-bank editor transfer
   (`midi_task` `handle_sysex`, talks to picoDSP-Edit) moves the whole 128-capacity image:
   the incoming WRITE is de-nibbleized on the fly into one `STORAGE_IMAGE_SIZE` (~28 KB)
   buffer and the DUMP is nibbleized on the fly, so the 2x-larger nibbleized stream never sits
@@ -59,6 +59,18 @@ port. Has its own `.cargo/config.toml` (host target). Examples:
   gate→erase→write→reinit cycle** (see PSRAM note). Note: BLE/USB Program Change is 7-bit, so
   presets >=128 aren't PC-addressable. Editor side: `../picoDSP-Edit` `STORAGE_SIZE`/`VERSION`
   must match this firmware.
+  - **Boot reformat is DEFERRED until core1 is running.** A version bump means the 7-sector
+    bank must be rewritten at boot, but every embassy flash op pauses core1 over the SIO FIFO
+    (`multicore::pause_core1` waits for core1 to echo a token). Before core1 is launched that
+    "echo" comes from the **bootrom**, which desyncs after a handful of ops and **hangs
+    mid-format** (single-sector writes survive — that's why a ≤1-sector bank formatted fine
+    bare at boot, but 7 sectors don't). So `main()` only *decides* via `storage.needs_format()`
+    (one safe read) and seeds core1 from the in-RAM defaults; the actual `storage.format()`
+    runs at the **start of `midi_task`**, after it waits for `CORE1_RUNNING` — by then core1
+    answers the FIFO pause for real and `main_task`'s audio drain loop is live (so `write_raw`'s
+    per-sector core1 gate gets ACKed and core1 never blocks in `AUDIO_CHANNEL.send`). This is
+    the same proven path as the runtime `ResetStorage` command. **Do not call `format()` bare
+    at boot.**
 - **PSRAM** (`src/psram.rs`): 8 MiB APS6404L on QMI CS1, backs the delay ring buffers. Shares
   the QMI bus with flash — flash writes need a settle + CS1 reinit + a core1 PSRAM gate
   (`PSRAM_GATE_REQ/ACK`). The reinit (`Psram::new`) does its own `multicore::pause_core1`, so

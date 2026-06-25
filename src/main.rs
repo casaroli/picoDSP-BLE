@@ -118,12 +118,23 @@ async fn main(spawner: Spawner) {
 
     let flash = Flash::new(p.FLASH, p.DMA_CH0, Irqs);
     let mut storage = Storage::new(flash);
-    storage.init().await;
+    // Only DECIDE whether a reformat is needed here (a single, safe flash read). The actual
+    // 7-sector bank rewrite is deferred to midi_task, which runs it once core1 is up and the
+    // audio loop is draining — every embassy flash op pauses core1 over the SIO FIFO, and that
+    // handshake only works reliably once core1 is really running (pre-core1 it relies on the
+    // bootrom's FIFO echo, which desyncs after a handful of ops and hangs mid-format).
+    let needs_format = storage.needs_format().await;
 
-    let preset = storage
-        .load_preset(4)
-        .await
-        .unwrap_or_else(|| crate::data::presets::get_default_presets()[4]);
+    // If a reformat is pending the on-flash bank is stale/absent, so seed core1 from the in-RAM
+    // factory defaults instead of reading it back. Otherwise load the stored boot preset.
+    let preset = if needs_format {
+        crate::data::presets::get_default_presets()[4]
+    } else {
+        storage
+            .load_preset(4)
+            .await
+            .unwrap_or_else(|| crate::data::presets::get_default_presets()[4])
+    };
 
     let midi_control = Arc::new(MidiControl::new());
 
@@ -189,5 +200,5 @@ async fn main(spawner: Spawner) {
         .unwrap(),
     );
 
-    core0::main_task(spawner, p.USB, i2s, midi_control, storage).await;
+    core0::main_task(spawner, p.USB, i2s, midi_control, storage, needs_format).await;
 }
