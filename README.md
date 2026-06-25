@@ -1,4 +1,4 @@
-# rp2350-synth
+# picoDSP-BLE
 
 A polyphonic-voiced (mono-priority) **synthesizer firmware** for the **RP2350**
 (specifically the [Pimoroni Pico Plus 2 W](https://shop.pimoroni.com/products/pimoroni-pico-plus-2-w)),
