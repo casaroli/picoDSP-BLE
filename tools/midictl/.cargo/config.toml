@@ -1,0 +1,6 @@
+# The repo root .cargo/config.toml forces the embedded target (thumbv8m). Override it
+# here so this host tool builds for the host. Change this to your host triple if you are
+# not on Apple Silicon (e.g. `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`); find it
+# with `rustc -vV | grep host`.
+[build]
+target = "aarch64-apple-darwin"

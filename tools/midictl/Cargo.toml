@@ -1,0 +1,12 @@
+[package]
+name = "midictl"
+version = "0.1.0"
+edition = "2021"
+description = "Tiny host-side MIDI sender for driving the rp2350-synth over USB-MIDI"
+
+# Standalone workspace so this host tool is isolated from the embedded crate above it
+# (and is not pulled into the firmware's dependency graph / target).
+[workspace]
+
+[dependencies]
+midir = "0.9"
