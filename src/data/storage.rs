@@ -26,6 +26,11 @@ const fn sectors_ceil(n: u32) -> u32 {
     n.div_ceil(SECTOR_SIZE) * SECTOR_SIZE
 }
 
+/// Size of the full on-flash storage image (header + MAX_PRESETS presets, rounded up to a
+/// whole number of sectors). The SysEx editor transfer is sized to this. 16 + 128*200 =
+/// 25616 -> 28672 (7 sectors). Must equal the editor's `STORAGE_SIZE` in picoDSP-Edit.
+pub const STORAGE_IMAGE_SIZE: usize = sectors_ceil(HEADER_SIZE + (MAX_PRESETS as u32) * 200) as usize;
+
 #[repr(C)]
 struct StorageHeader {
     magic: u32,
@@ -162,24 +167,50 @@ impl<'d> Storage<'d> {
     }
 
     pub async fn write_raw(&mut self, data: &[u8]) {
-        // Park core1 off PSRAM for the whole flash write + reconfigure (the delay buffer
-        // shares the QMI bus with flash), then release once PSRAM is reconfigured.
-        crate::psram::lock_core1_off_psram().await;
+        // Write the image ONE 4 KB sector at a time, each as a fully independent, proven-safe
+        // cycle: park core1 off PSRAM (our gate) -> erase 1 sector -> write 1 sector ->
+        // settle + full PSRAM reinit -> release core1. A full 128-preset bank spans 7 sectors.
+        //
+        // Why per-sector with a *complete* cycle (not one gate around all sectors + one final
+        // reinit): the reinit's `Psram::new` does its own `multicore::pause_core1()`. Holding
+        // core1 in our gate spin across many embassy flash-op pause/resume cycles and then
+        // nesting reinit's pause deadlocks (see docs/psram-flash-corruption-investigation.md).
+        // Releasing core1 between sectors returns it to a known-good thread-mode state, so each
+        // sector reuses the exact single-sector path that's been verified safe.
+        let total = sectors_ceil(data.len() as u32).min(STORAGE_SIZE);
+        log_storage!(
+            "SysEx Write: {} bytes -> {} sectors\r\n",
+            data.len(),
+            total / SECTOR_SIZE
+        );
+        let mut off = 0u32;
+        while off < total {
+            crate::psram::lock_core1_off_psram().await;
 
-        // Erase as many whole sectors as `data` spans (a full 128-preset bank is 7 sectors),
-        // capped at the reserved region. `data` is expected to be a sector-multiple image.
-        let erase_len = sectors_ceil(data.len() as u32).min(STORAGE_SIZE);
-        log_storage!("SysEx Write: Erasing {} bytes...\r\n", erase_len);
-        self.flash
-            .erase(ADDR_OFFSET, ADDR_OFFSET + erase_len)
-            .await
-            .unwrap();
+            let sec = ADDR_OFFSET + off;
+            // Barriers around each embassy flash op: erase/write internally pause+resume core1
+            // over the SIO FIFO, and the following `after_flash_write` -> `Psram::new` pauses it
+            // again. Without a barrier between them the second pause can fire before core1's
+            // resume from the first is globally visible, nesting the FIFO handshake into a
+            // deadlock. (A stray defmt log here masked it; make the ordering explicit instead.)
+            cortex_m::asm::dsb();
+            self.flash.erase(sec, sec + SECTOR_SIZE).await.unwrap();
+            cortex_m::asm::dsb();
 
-        log_storage!("SysEx Write: Writing {} bytes...\r\n", data.len());
-        self.flash.write(ADDR_OFFSET, data).await.unwrap();
+            // Full-sector buffer; pad the tail of a partial final sector with zeros.
+            let mut sector = [0u8; SECTOR_SIZE as usize];
+            let src = off as usize;
+            if src < data.len() {
+                let n = (data.len() - src).min(SECTOR_SIZE as usize);
+                sector[..n].copy_from_slice(&data[src..src + n]);
+            }
+            self.flash.write(sec, &sector).await.unwrap();
+            cortex_m::asm::dsb();
 
-        crate::psram::after_flash_write();
-        crate::psram::unlock_core1();
+            crate::psram::after_flash_write();
+            crate::psram::unlock_core1();
+            off += SECTOR_SIZE;
+        }
 
         log_storage!("SysEx Write: Done.\r\n");
     }

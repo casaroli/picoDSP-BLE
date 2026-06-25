@@ -1,5 +1,7 @@
 use crate::common::shared::{BLE_MIDI_CHANNEL, SystemCommand, COMMAND_CHANNEL, PRESET_CHANNEL};
-use crate::data::storage::{Storage, MAGIC as STORAGE_MAGIC, VERSION as STORAGE_VERSION};
+use crate::data::storage::{
+    Storage, MAGIC as STORAGE_MAGIC, STORAGE_IMAGE_SIZE, VERSION as STORAGE_VERSION,
+};
 use crate::usb::logger::{LED_SIGNAL_CHANNEL, MIDI_LOG_CHANNEL};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -382,6 +384,138 @@ async fn load_and_apply_preset(storage: &mut Storage<'static>, index: usize, mid
     }
 }
 
+/// Streams a SysEx message out as USB-MIDI packets: buffers content bytes into groups of
+/// three and emits the correct end-of-SysEx CIN. Used for the dump response.
+struct SysexTx<'a> {
+    sender: &'a mut Sender<'static, Driver<'static, USB>>,
+    buf: [u8; 3],
+    len: usize,
+}
+
+impl<'a> SysexTx<'a> {
+    async fn push(&mut self, b: u8) {
+        self.buf[self.len] = b;
+        self.len += 1;
+        if self.len == 3 {
+            let _ = self
+                .sender
+                .write_packet(&[0x04, self.buf[0], self.buf[1], self.buf[2]])
+                .await;
+            self.len = 0;
+        }
+    }
+
+    /// Flush the trailing 0..=2 buffered bytes plus the terminator (0xF7) with the matching CIN.
+    async fn end(&mut self) {
+        let p = match self.len {
+            0 => [0x05, SYSEX_END, 0x00, 0x00],
+            1 => [0x06, self.buf[0], SYSEX_END, 0x00],
+            _ => [0x07, self.buf[0], self.buf[1], SYSEX_END],
+        };
+        let _ = self.sender.write_packet(&p).await;
+        self.len = 0;
+    }
+}
+
+/// Send the full storage image to the editor as one CMD_WRITE_REQ SysEx, nibbleizing on the
+/// fly (no 2x encode buffer).
+async fn send_sysex_dump(sender: &mut Sender<'static, Driver<'static, USB>>, image: &[u8]) {
+    let mut tx = SysexTx {
+        sender,
+        buf: [0; 3],
+        len: 0,
+    };
+    tx.push(SYSEX_START).await;
+    tx.push(SYSEX_ID).await;
+    tx.push(SYSEX_MODEL).await;
+    tx.push(CMD_WRITE_REQ).await;
+    for &b in image {
+        tx.push((b >> 4) & 0x0F).await;
+        tx.push(b & 0x0F).await;
+    }
+    tx.end().await;
+}
+
+/// Send a one-byte (success) or two-byte (error) status SysEx back to the editor.
+async fn send_sysex_status(
+    sender: &mut Sender<'static, Driver<'static, USB>>,
+    cmd: u8,
+    err: Option<u8>,
+) {
+    let _ = sender
+        .write_packet(&[0x04, SYSEX_START, SYSEX_ID, SYSEX_MODEL])
+        .await;
+    let p = match err {
+        None => [0x06, cmd, SYSEX_END, 0x00],
+        Some(e) => [0x07, cmd, e, SYSEX_END],
+    };
+    let _ = sender.write_packet(&p).await;
+}
+
+/// Handle a complete SysEx command from the editor (picoDSP-Edit): full-bank dump or write.
+/// `image` is the de-nibbleized storage image buffer (`STORAGE_IMAGE_SIZE`); for a WRITE it
+/// already holds the decoded `raw_len` bytes, for a DUMP it is reused as the read scratch.
+async fn handle_sysex(
+    cmd: u8,
+    image: &mut [u8],
+    raw_len: usize,
+    overflow: bool,
+    storage: &mut Storage<'static>,
+    sender: &mut Sender<'static, Driver<'static, USB>>,
+    midi_control: &MidiControl,
+    current_preset_index: usize,
+) {
+    match cmd {
+        CMD_DUMP_REQ => {
+            log_midi!("SysEx: Dump Request\r\n");
+            let n = STORAGE_IMAGE_SIZE.min(image.len());
+            storage.read_raw(&mut image[..n]).await;
+            send_sysex_dump(sender, &image[..n]).await;
+            log_midi!("SysEx: Dump Sent ({} bytes)\r\n", n);
+        }
+        CMD_WRITE_REQ => {
+            defmt::info!("SysEx WRITE_REQ from Edit: {=usize} decoded bytes", raw_len);
+            if overflow || raw_len != STORAGE_IMAGE_SIZE {
+                log_midi!("SysEx: Invalid Length ({})\r\n", raw_len);
+                defmt::warn!(
+                    "SysEx REJECTED bad length: {=usize} bytes (expected {=usize})",
+                    raw_len,
+                    STORAGE_IMAGE_SIZE
+                );
+                send_sysex_status(sender, CMD_WRITE_ERROR, Some(ERR_BAD_LENGTH)).await;
+                return;
+            }
+            let magic = u32::from_le_bytes([image[0], image[1], image[2], image[3]]);
+            let version = u32::from_le_bytes([image[4], image[5], image[6], image[7]]);
+            if magic == STORAGE_MAGIC && version == STORAGE_VERSION {
+                storage.write_raw(&image[..raw_len]).await;
+                log_midi!("SysEx: Write Success\r\n");
+                defmt::info!(
+                    "SysEx write OK -> flash; reloading active preset {=usize}",
+                    current_preset_index
+                );
+                send_sysex_status(sender, CMD_WRITE_SUCCESS, None).await;
+                load_and_apply_preset(storage, current_preset_index, midi_control).await;
+            } else {
+                log_midi!(
+                    "SysEx: Invalid Magic/Version ({:X}, {})\r\n",
+                    magic,
+                    version
+                );
+                defmt::warn!(
+                    "SysEx REJECTED bad magic/version: magic={=u32:#x} version={=u32} (expected {=u32:#x}/{=u32})",
+                    magic,
+                    version,
+                    STORAGE_MAGIC,
+                    STORAGE_VERSION
+                );
+                send_sysex_status(sender, CMD_WRITE_ERROR, Some(ERR_BAD_MAGIC)).await;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Handle a single channel-voice MIDI message. Shared by the USB-MIDI path and the
 /// BLE-MIDI path so both transports drive the synth through identical logic.
 async fn handle_voice_message(
@@ -508,8 +642,15 @@ pub async fn midi_task(
 
     let mut current_preset_index = 4;
 
-    let mut sysex_buf = vec![0u8; 8192 + 32];
-    let mut sysex_idx = 0;
+    // De-nibbleized SysEx image buffer. Incoming WRITE nibbles are decoded on the fly into
+    // here (2 nibbles -> 1 byte) so the 2x-larger nibbleized stream is never held in RAM; a
+    // DUMP reads the storage image into the same buffer. ~28 KB, sits alongside the synth.
+    let mut sysex_image = vec![0u8; STORAGE_IMAGE_SIZE];
+    let mut sysex_hdr = [0u8; 4]; // F0, manufacturer, model, command
+    let mut sysex_hdr_len = 0usize;
+    let mut sysex_raw_idx = 0usize; // decoded bytes in sysex_image
+    let mut sysex_hi: i16 = -1; // pending high nibble (-1 = none)
+    let mut sysex_overflow = false;
     let mut in_sysex = false;
 
     loop {
@@ -566,269 +707,62 @@ pub async fn midi_task(
                             let d2 = packet[3];
 
                             if cin == 0x4 || cin == 0x5 || cin == 0x6 || cin == 0x7 {
-                                if cin == 0x4 {
-                                    if !in_sysex {
+                                // SysEx (USB-MIDI CINs 0x4=3 bytes, 0x5/0x6/0x7=end w/ 1/2/3).
+                                // Decode the editor's nibbleized payload on the fly into the
+                                // image buffer so we never hold the 2x nibbleized stream.
+                                let nbytes = match cin {
+                                    0x4 => 3,
+                                    0x5 => 1,
+                                    0x6 => 2,
+                                    0x7 => 3,
+                                    _ => 0,
+                                };
+                                for &b in &packet[1..1 + nbytes] {
+                                    if b == SYSEX_START {
                                         in_sysex = true;
-                                        sysex_idx = 0;
-                                    }
-                                    if sysex_idx + 3 < sysex_buf.len() {
-                                        sysex_buf[sysex_idx] = packet[1];
-                                        sysex_buf[sysex_idx + 1] = packet[2];
-                                        sysex_buf[sysex_idx + 2] = packet[3];
-                                        sysex_idx += 3;
-                                    }
-                                } else {
-                                    let len = match cin {
-                                        0x5 => 1,
-                                        0x6 => 2,
-                                        0x7 => 3,
-                                        _ => 0,
-                                    };
-
-                                    if in_sysex && sysex_idx + len <= sysex_buf.len() {
-                                        sysex_buf[sysex_idx..sysex_idx + len]
-                                            .copy_from_slice(&packet[1..1 + len]);
-                                        sysex_idx += len;
+                                        sysex_hdr[0] = b;
+                                        sysex_hdr_len = 1;
+                                        sysex_raw_idx = 0;
+                                        sysex_hi = -1;
+                                        sysex_overflow = false;
+                                    } else if !in_sysex {
+                                        // stray byte outside a SysEx -> ignore
+                                    } else if sysex_hdr_len < 4 {
+                                        sysex_hdr[sysex_hdr_len] = b;
+                                        sysex_hdr_len += 1;
+                                    } else if b == SYSEX_END {
                                         in_sysex = false;
-
-                                        let msg = &sysex_buf[..sysex_idx];
-                                        if msg.len() >= 5
-                                            && msg[0] == SYSEX_START
-                                            && msg[msg.len() - 1] == SYSEX_END
+                                        if sysex_hi >= 0 {
+                                            sysex_overflow = true; // dangling nibble
+                                        }
+                                        if sysex_hdr[1] == SYSEX_ID
+                                            && sysex_hdr[2] == SYSEX_MODEL
                                         {
-                                            if msg[1] == SYSEX_ID && msg[2] == SYSEX_MODEL {
-                                                let cmd = msg[3];
-                                                match cmd {
-                                                    CMD_DUMP_REQ => {
-                                                        log_midi!("SysEx: Dump Request\r\n");
-                                                        let mut raw_data = vec![0u8; 4096];
-                                                        storage.read_raw(&mut raw_data).await;
-
-                                                        let p1 = [
-                                                            0x04,
-                                                            SYSEX_START,
-                                                            SYSEX_ID,
-                                                            SYSEX_MODEL,
-                                                        ];
-                                                        let _ = sender.write_packet(&p1).await;
-
-                                                        let h0 = (raw_data[0] >> 4) & 0x0F;
-                                                        let l0 = raw_data[0] & 0x0F;
-                                                        let p2 = [0x04, CMD_WRITE_REQ, h0, l0];
-                                                        let _ = sender.write_packet(&p2).await;
-
-                                                        let mut encoded_buf = vec![0u8; 8190];
-                                                        let mut enc_idx = 0;
-                                                        for byte in raw_data.iter().skip(1) {
-                                                            encoded_buf[enc_idx] =
-                                                                (byte >> 4) & 0x0F;
-                                                            encoded_buf[enc_idx + 1] = byte & 0x0F;
-                                                            enc_idx += 2;
-                                                        }
-
-                                                        let mut i = 0;
-                                                        let mut f7_sent = false;
-                                                        let mut packet_count = 2;
-
-                                                        while i < encoded_buf.len() {
-                                                            let remaining = encoded_buf.len() - i;
-                                                            if remaining >= 3 {
-                                                                let _ = sender
-                                                                    .write_packet(&[
-                                                                        0x04,
-                                                                        encoded_buf[i],
-                                                                        encoded_buf[i + 1],
-                                                                        encoded_buf[i + 2],
-                                                                    ])
-                                                                    .await;
-                                                                i += 3;
-                                                                packet_count += 1;
-                                                            } else {
-                                                                let packet = if remaining == 2 {
-                                                                    [
-                                                                        0x07,
-                                                                        encoded_buf[i],
-                                                                        encoded_buf[i + 1],
-                                                                        0xF7,
-                                                                    ]
-                                                                } else if remaining == 1 {
-                                                                    [
-                                                                        0x06,
-                                                                        encoded_buf[i],
-                                                                        0xF7,
-                                                                        0x00,
-                                                                    ]
-                                                                } else {
-                                                                    [0x05, 0xF7, 0x00, 0x00]
-                                                                };
-
-                                                                let _ = sender
-                                                                    .write_packet(&packet)
-                                                                    .await;
-                                                                packet_count += 1;
-                                                                f7_sent = true;
-                                                                break;
-                                                            }
-                                                        }
-
-                                                        if !f7_sent {
-                                                            let p_end = [0x05, 0xF7, 0x00, 0x00];
-                                                            let _ =
-                                                                sender.write_packet(&p_end).await;
-                                                            packet_count += 1;
-                                                        }
-                                                        log_midi!(
-                                                            "SysEx: Dump Sent ({} packets)\r\n",
-                                                            packet_count
-                                                        );
-                                                    }
-                                                    CMD_WRITE_REQ => {
-                                                        log_midi!(
-                                                            "SysEx: Write Request ({} bytes)\r\n",
-                                                            msg.len()
-                                                        );
-                                                        defmt::info!(
-                                                            "SysEx WRITE_REQ from Edit: {=usize} bytes",
-                                                            msg.len()
-                                                        );
-                                                        let encoded_data = &msg[4..msg.len() - 1];
-                                                        if encoded_data.len() == 8192 {
-                                                            let mut decoded_data = vec![0u8; 4096];
-                                                            for i in 0..4096 {
-                                                                let h = encoded_data[i * 2];
-                                                                let l = encoded_data[i * 2 + 1];
-                                                                decoded_data[i] =
-                                                                    (h << 4) | (l & 0x0F);
-                                                            }
-
-                                                            let magic = u32::from_le_bytes([
-                                                                decoded_data[0],
-                                                                decoded_data[1],
-                                                                decoded_data[2],
-                                                                decoded_data[3],
-                                                            ]);
-                                                            let version = u32::from_le_bytes([
-                                                                decoded_data[4],
-                                                                decoded_data[5],
-                                                                decoded_data[6],
-                                                                decoded_data[7],
-                                                            ]);
-
-                                                            if magic == STORAGE_MAGIC
-                                                                && version == STORAGE_VERSION
-                                                            {
-                                                                storage
-                                                                    .write_raw(&decoded_data)
-                                                                    .await;
-                                                                log_midi!(
-                                                                    "SysEx: Write Success\r\n"
-                                                                );
-                                                                defmt::info!(
-                                                                    "SysEx write OK -> flash; reloading active preset {=usize}",
-                                                                    current_preset_index
-                                                                );
-
-                                                                let _ = sender
-                                                                    .write_packet(&[
-                                                                        0x04,
-                                                                        SYSEX_START,
-                                                                        SYSEX_ID,
-                                                                        SYSEX_MODEL,
-                                                                    ])
-                                                                    .await;
-                                                                let _ = sender
-                                                                    .write_packet(&[
-                                                                        0x06,
-                                                                        CMD_WRITE_SUCCESS,
-                                                                        SYSEX_END,
-                                                                        0x00,
-                                                                    ])
-                                                                    .await;
-
-                                                                if let Some(preset) = storage
-                                                                    .load_preset(
-                                                                        current_preset_index,
-                                                                    )
-                                                                    .await
-                                                                {
-                                                                    log_midi!("Reloading active preset {}\r\n", current_preset_index);
-                                                                    let cutoff_norm = libm::log10f(
-                                                                        preset.filter.cutoff / 20.0,
-                                                                    )
-                                                                        / libm::log10f(1000.0);
-                                                                    midi_control.set_parameter_1(
-                                                                        cutoff_norm.clamp(0.0, 1.0),
-                                                                    );
-                                                                    let res_norm =
-                                                                        (preset.filter.resonance
-                                                                            - 0.707)
-                                                                            / 9.3;
-                                                                    midi_control.set_parameter_2(
-                                                                        res_norm.clamp(0.0, 1.0),
-                                                                    );
-                                                                    midi_control.set_portamento(
-                                                                        preset.portamento,
-                                                                    );
-
-                                                                    let _ = PRESET_CHANNEL
-                                                                        .try_send(preset);
-                                                                }
-                                                            } else {
-                                                                log_midi!("SysEx: Invalid Magic/Version ({:X}, {})\r\n", magic, version);
-                                                                defmt::warn!(
-                                                                    "SysEx REJECTED bad magic/version: magic={=u32:#x} version={=u32} (expected {=u32:#x}/{=u32})",
-                                                                    magic,
-                                                                    version,
-                                                                    STORAGE_MAGIC,
-                                                                    STORAGE_VERSION
-                                                                );
-                                                                let _ = sender
-                                                                    .write_packet(&[
-                                                                        0x04,
-                                                                        SYSEX_START,
-                                                                        SYSEX_ID,
-                                                                        SYSEX_MODEL,
-                                                                    ])
-                                                                    .await;
-                                                                let _ = sender
-                                                                    .write_packet(&[
-                                                                        0x07,
-                                                                        CMD_WRITE_ERROR,
-                                                                        ERR_BAD_MAGIC,
-                                                                        SYSEX_END,
-                                                                    ])
-                                                                    .await;
-                                                            }
-                                                        } else {
-                                                            log_midi!(
-                                                                "SysEx: Invalid Length ({})\r\n",
-                                                                encoded_data.len()
-                                                            );
-                                                            defmt::warn!(
-                                                                "SysEx REJECTED bad length: encoded {=usize} bytes (expected 8192)",
-                                                                encoded_data.len()
-                                                            );
-                                                            let _ = sender
-                                                                .write_packet(&[
-                                                                    0x04,
-                                                                    SYSEX_START,
-                                                                    SYSEX_ID,
-                                                                    SYSEX_MODEL,
-                                                                ])
-                                                                .await;
-                                                            let _ = sender
-                                                                .write_packet(&[
-                                                                    0x07,
-                                                                    CMD_WRITE_ERROR,
-                                                                    ERR_BAD_LENGTH,
-                                                                    SYSEX_END,
-                                                                ])
-                                                                .await;
-                                                        }
-                                                    }
-                                                    _ => {}
-                                                }
+                                            handle_sysex(
+                                                sysex_hdr[3],
+                                                &mut sysex_image,
+                                                sysex_raw_idx,
+                                                sysex_overflow,
+                                                &mut storage,
+                                                &mut sender,
+                                                midi_control.as_ref(),
+                                                current_preset_index,
+                                            )
+                                            .await;
+                                        }
+                                    } else {
+                                        // Payload nibble (0x00..=0x0F): combine pairs.
+                                        if sysex_hi < 0 {
+                                            sysex_hi = (b & 0x0F) as i16;
+                                        } else {
+                                            if sysex_raw_idx < sysex_image.len() {
+                                                sysex_image[sysex_raw_idx] =
+                                                    ((sysex_hi as u8) << 4) | (b & 0x0F);
+                                                sysex_raw_idx += 1;
+                                            } else {
+                                                sysex_overflow = true;
                                             }
+                                            sysex_hi = -1;
                                         }
                                     }
                                 }

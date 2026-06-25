@@ -143,6 +143,10 @@ pub fn after_flash_write() {
 pub fn reinit() {
     boost_qspi_pads();
     let cs1 = QmiCs1::new(unsafe { QMI_CS1::steal() }, unsafe { PIN_47::steal() });
+    // Ensure core1's resume from the preceding flash op's pause is globally visible before
+    // Psram::new issues its own `pause_core1` — otherwise the FIFO handshake can nest/deadlock.
+    cortex_m::asm::dsb();
+    cortex_m::asm::isb();
     match Psram::new(cs1, psram_config()) {
         Ok(_) => info!("PSRAM: re-init after flash op OK"),
         Err(e) => defmt::error!("PSRAM re-init after flash failed: {:?}", e),
