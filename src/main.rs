@@ -140,8 +140,8 @@ async fn main(spawner: Spawner) {
 
     let cutoff_norm = libm::log10f(preset.filter.cutoff / 20.0) / libm::log10f(1000.0);
     midi_control.set_parameter_1(cutoff_norm.clamp(0.0, 1.0));
-    let res_norm = (preset.filter.resonance - 0.707) / 9.3;
-    midi_control.set_parameter_2(res_norm.clamp(0.0, 1.0));
+    // Resonance is a direct 0..1 ladder value (filter feedback k = 4*r; self-osc at 1.0).
+    midi_control.set_parameter_2(preset.filter.resonance.clamp(0.0, 1.0));
 
     let midi_control_core1 = midi_control.clone();
 

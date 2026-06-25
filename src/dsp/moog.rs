@@ -14,7 +14,7 @@ use infinitedsp_core::synthesis::lfo::Lfo;
 use infinitedsp_core::synthesis::oscillator::{Oscillator, Waveform};
 
 use crate::control::midi::{
-    MidiControl, MidiFilterCutoff, MidiFilterResonance, MidiFreq, MidiGate,
+    MidiControl, MidiFilterCutoff, MidiFilterResonance, MidiFreq, MidiGate, MidiVelocity,
 };
 use crate::data::presets::{OscSettings, Preset};
 
@@ -130,8 +130,8 @@ pub fn new_moog_voice(
     let cutoff_norm = libm::log10f(preset.filter.cutoff / 20.0) / libm::log10f(1000.0);
     midi.set_parameter_1(cutoff_norm.clamp(0.0, 1.0));
 
-    let res_norm = (preset.filter.resonance - 0.707) / 9.3;
-    midi.set_parameter_2(res_norm.clamp(0.0, 1.0));
+    // Resonance is a direct 0..1 ladder value (filter feedback k = 4*r; self-osc at 1.0).
+    midi.set_parameter_2(preset.filter.resonance.clamp(0.0, 1.0));
 
     let (vibrato_node, filter_lfo_node) = if preset.lfo_enabled != 0 {
         let p = &preset.lfo;
@@ -259,7 +259,12 @@ pub fn new_moog_voice(
         AudioParam::Static(preset.amp.release),
     );
 
-    let vca = Gain::new(AudioParam::Dynamic(Box::new(amp_env)));
+    // Scale the amp envelope by note velocity (fixed, always-on velocity sensitivity), then
+    // use the product as the VCA gain so harder hits play louder.
+    let amp_env_vel = DspChain::new(amp_env, sample_rate).and(Gain::new(AudioParam::Dynamic(
+        Box::new(MidiVelocity(midi.clone())),
+    )));
+    let vca = Gain::new(AudioParam::Dynamic(Box::new(amp_env_vel)));
 
     DspChain::new(mixer, sample_rate).and(filter_node).and(vca)
 }

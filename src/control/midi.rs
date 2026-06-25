@@ -383,10 +383,11 @@ impl FrameProcessor<Mono> for MidiFilterCutoff {
 pub struct MidiFilterResonance(pub Arc<MidiControl>);
 impl FrameProcessor<Mono> for MidiFilterResonance {
     fn process(&mut self, buffer: &mut [f32], _frame_index: u64) {
+        // parameter_2 is the ladder resonance directly (0..1); the filter turns it into
+        // feedback k = 4*r and self-oscillates as r -> 1.0.
         let val = self.0.get_parameter_2();
-        let q = 0.707 + (val * 9.3);
         for sample in buffer.iter_mut() {
-            *sample = q;
+            *sample = val;
         }
     }
     fn set_sample_rate(&mut self, _sample_rate: f32) {}
@@ -410,8 +411,7 @@ async fn load_and_apply_preset(storage: &mut Storage<'static>, index: usize, mid
         log_midi!("Loaded: {}\r\n", preset.get_name());
         let cutoff_norm = libm::log10f(preset.filter.cutoff / 20.0) / libm::log10f(1000.0);
         midi_control.set_parameter_1(cutoff_norm.clamp(0.0, 1.0));
-        let res_norm = (preset.filter.resonance - 0.707) / 9.3;
-        midi_control.set_parameter_2(res_norm.clamp(0.0, 1.0));
+        midi_control.set_parameter_2(preset.filter.resonance.clamp(0.0, 1.0));
         midi_control.set_portamento(preset.portamento);
         let _ = PRESET_CHANNEL.try_send(preset);
     } else {
