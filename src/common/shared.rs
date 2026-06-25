@@ -34,7 +34,7 @@ pub const SAMPLE_RATE: f32 = 48000.0;
 // keep instruction fetch off the QMI bus. The heap is cut from 400 KB to 256 KB
 // to pay for the relocated code while keeping stack headroom:
 // BSS(~64 KB) + heap(256 KB) + .ram_code(~78 KB) + .data leaves ~100 KB of stack.
-pub const HEAP_SIZE: usize = 256000;
+pub const HEAP_SIZE: usize = 208000;
 pub const BLOCK_SIZE: usize = 256;
 pub const CORE1_STACK_SIZE: usize = 16384;
 

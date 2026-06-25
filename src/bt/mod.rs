@@ -112,6 +112,10 @@ impl EventHandler for MidiScanHandler {
 
 /// Returns true if the advertising payload lists `uuid` among its 128-bit service-class UUIDs
 /// (AD types 0x06 incomplete / 0x07 complete).
+///
+/// RAM-resident: runs per advertising report while scanning (radio on, even when not
+/// connected), so keep its fetches off the QMI/XIP bus that the core1 PSRAM delay shares.
+#[unsafe(link_section = ".data.ram_func")]
 fn adv_contains_uuid(mut data: &[u8], uuid: &[u8; 16]) -> bool {
     while data.len() >= 2 {
         let len = data[0] as usize;
@@ -137,6 +141,9 @@ fn adv_contains_uuid(mut data: &[u8], uuid: &[u8; 16]) -> bool {
 /// BLE-MIDI prefixes a header byte (timestamp high), then each MIDI message is preceded by a
 /// timestamp-low byte; the status byte may be omitted for running status. We only forward
 /// channel-voice messages (note/CC/pitch-bend/program); SysEx and system messages are ignored.
+///
+/// RAM-resident: runs per BLE-MIDI notification while playing — keep it off the QMI/XIP bus.
+#[unsafe(link_section = ".data.ram_func")]
 fn parse_ble_midi(packet: &[u8]) {
     if packet.len() < 3 {
         return;

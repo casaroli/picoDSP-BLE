@@ -106,11 +106,39 @@ SECTIONS {
         *(.text.*cyw43*)
         *(.text.*infinitedsp_core*)
         *(.text.*libm*)
+        /* BLE host stack HOT path: runs on core0 while the radio is on (scanning adv
+         * reports even when not connected, GATT/ATT notifications when connected). Its XIP
+         * instruction fetches contend with the core1 PSRAM delay over the QMI bus -> audio
+         * clicks. We relocate the per-event hot modules but deliberately NOT
+         * trouble_host::security_manager (~53 KB, only runs once per pairing — cold). Module
+         * prefixes are legacy-mangled "<crate-len>trouble_host<mod-len><mod>". */
+        *(.text.*bt_hci*)
+        *(.text.*trouble_host4host*)            /* the Runner / HCI event dispatch */
+        *(.text.*trouble_host3att*)             /* ATT (GATT notifications) */
+        *(.text.*trouble_host15channel_manager*) /* L2CAP channels */
+        *(.text.*trouble_host18connection_manager*)
+        *(.text.*trouble_host11packet_pool*)
+        *(.text.*trouble_host7central*)         /* scan / connect */
+        *(.text.*trouble_host10connection*)
+        *(.text.*trouble_host4gatt*)
+        *(.text.*trouble_host5l2cap*)
+        *(.text.*trouble_host3pdu*)
+        *(.text.*trouble_host5codec*)
+        *(.text.*trouble_host6cursor*)
+        *(.text.*trouble_host4scan*)
+        /* MIDI hot path in this crate: midi_task + handle_voice_message + NoteStack +
+         * midi_to_freq run per MIDI message (USB and BLE) on core0. (parse_ble_midi is
+         * tagged .data.ram_func directly.) */
+        *(.text.*rp2350_synth7control4midi*)
         /* rodata jump tables for the same hot paths (read over XIP during
          * match-arm dispatch); pulled to RAM to remove the last QMI data reads. */
         *(.rodata..Lswitch.table.*cyw43*)
         *(.rodata..Lswitch.table.*infinitedsp_core*)
         *(.rodata..Lswitch.table.*libm*)
+        *(.rodata..Lswitch.table.*bt_hci*)
+        *(.rodata..Lswitch.table.*trouble_host4host*)
+        *(.rodata..Lswitch.table.*trouble_host3att*)
+        *(.rodata..Lswitch.table.*trouble_host15channel_manager*)
         . = ALIGN(4);
         __sram_code_end = .;
     } > RAM AT > FLASH
