@@ -6,7 +6,9 @@ use embedded_storage_async::nor_flash::NorFlash;
 
 // "PDSP"
 pub const MAGIC: u32 = 0x50445350;
-pub const VERSION: u32 = 7;
+// Bump on any change to the default preset bank or the on-flash layout so existing
+// devices re-format and preload the new defaults on next boot.
+pub const VERSION: u32 = 8;
 
 const FLASH_SIZE: u32 = 2 * 1024 * 1024;
 const STORAGE_SIZE: u32 = 64 * 1024;
