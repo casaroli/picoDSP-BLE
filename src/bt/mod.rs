@@ -285,7 +285,18 @@ async fn run_gatt<C: Controller>(
                     info!("[bt] connection interval now {} ms", conn_interval.as_millis());
                 }
                 ConnectionEvent::RequestConnectionParams(req) => {
-                    let _ = req.accept(None, stack).await;
+                    let p = req.params();
+                    info!(
+                        "[bt] param req: interval {}..{} ms, latency {}, timeout {} ms",
+                        p.min_connection_interval.as_millis(),
+                        p.max_connection_interval.as_millis(),
+                        p.max_latency,
+                        p.supervision_timeout.as_millis(),
+                    );
+                    match req.accept(None, stack).await {
+                        Ok(()) => info!("[bt] param req accepted"),
+                        Err(_) => warn!("[bt] param req accept failed"),
+                    }
                 }
                 ConnectionEvent::Disconnected { .. } => break,
                 _ => {}

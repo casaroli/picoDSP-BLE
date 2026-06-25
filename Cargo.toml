@@ -90,6 +90,14 @@ build = [
 [patch.crates-io]
 cyw43 = { path = "vendor/cyw43" }
 
+# Vendored trouble-host at the same pinned rev, patched so the L2CAP Connection Parameter
+# Update *response* echoes the request's signaling identifier (Core spec Vol 3 Part A §4.1)
+# instead of allocating a fresh one. Without this, a legacy BLE-MIDI keyboard never matches
+# our response to its request, its 30s RTX timer expires, and it drops the link with
+# "Unacceptable Connection Parameters" — re-pairing in a ~30s loop. (vendor/trouble)
+[patch."https://github.com/embassy-rs/trouble"]
+trouble-host = { path = "vendor/trouble/host" }
+
 [[bin]]
 name = "rp2350-synth"
 path = "src/main.rs"
