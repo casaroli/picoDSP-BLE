@@ -59,7 +59,13 @@ pub static AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioData, 4> = Chann
 /// I2S loop (the real-time timing master) `try_send`s each block here and never blocks on it;
 /// `microphone_task` drains it. If USB is closed or can't keep up, sends are dropped so the
 /// DAC output is never disturbed.
-pub static USB_AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioData, 4> = Channel::new();
+///
+/// Depth is kept shallow on purpose: the iso IN endpoint is async with no rate feedback, so
+/// the host SOF clock and our I2S clock drift and this queue tends to sit near-full rather
+/// than near-empty — its depth is effectively added USB latency (~2.7 ms per block). Depth 2
+/// keeps ~5.3 ms max while leaving one block of slack to absorb a brief `microphone_task`
+/// stall before it starts dropping.
+pub static USB_AUDIO_CHANNEL: Channel<CriticalSectionRawMutex, AudioData, 2> = Channel::new();
 pub static PRESET_CHANNEL: Channel<CriticalSectionRawMutex, Preset, 1> = Channel::new();
 pub static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, SystemCommand, 2> = Channel::new();
 
